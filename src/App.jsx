@@ -2,7 +2,7 @@ import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
 import { useState, useEffect } from 'react'
 import './styles/index.css'
 
-import Auth from './pages/Auth'
+import Landing from './pages/Landing'
 import Login from './pages/Login'
 import CreateAccount from './pages/CreateAccount'
 import Home from './pages/Home'
@@ -43,9 +43,10 @@ export default function App() {
     return (
       <BrowserRouter>
         <Routes>
+          <Route path="/"        element={<Landing />} />
           <Route path="/login"   element={<Login onAuth={handleAuth} />} />
           <Route path="/create"  element={<CreateAccount onAuth={handleAuth} />} />
-          <Route path="*"        element={<Auth onAuth={handleAuth} />} />
+          <Route path="*"        element={<Navigate to="/" />} />
         </Routes>
       </BrowserRouter>
     )
@@ -55,20 +56,21 @@ export default function App() {
     <BrowserRouter>
       <PageWrapper toggleTheme={toggleTheme} theme={theme}>
         <Routes>
-          <Route path="/"            element={<Home />} />
-          <Route path="/explore"     element={<Explore />} />
-          <Route path="/deals"       element={<Deals />} />
-          <Route path="/cart"        element={<Cart />} />
-          <Route path="/profile"     element={<Profile />} />
-          <Route path="/orders"      element={<Orders />} />
-          <Route path="/messages"    element={<Messages />} />
-          <Route path="/settings"    element={<Settings />} />
-          <Route path="/shop"        element={<MyShop />} />
+          <Route path="/"               element={<Home />} />
+          <Route path="/explore"        element={<Explore />} />
+          <Route path="/deals"          element={<Deals />} />
+          <Route path="/cart"           element={<Cart />} />
+          <Route path="/profile"        element={<Profile />} />
+          <Route path="/orders"         element={<Orders />} />
+          <Route path="/messages"       element={<Messages />} />
+          <Route path="/settings"       element={<Settings />} />
+          <Route path="/shop"           element={<MyShop />} />
           <Route path="/create-listing" element={<CreateListing />} />
-          <Route path="/product/:id" element={<ProductDetail />} />
-          <Route path="*"            element={<Navigate to="/" />} />
+          <Route path="/product/:id"    element={<ProductDetail />} />
+          <Route path="*"               element={<Navigate to="/" />} />
         </Routes>
       </PageWrapper>
     </BrowserRouter>
   )
 }
+
