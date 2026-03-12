@@ -253,6 +253,7 @@ export async function publishStall({ name, description, currency = 'SAT', shippi
 export async function publishProduct({
   name, description, price, images = [],
   stall_id, quantity = -1, categories = [],
+  shipping = [],
 }) {
   const sk = getSecretKey()
   const pk = getPublicKeyHex()
@@ -269,7 +270,7 @@ export async function publishProduct({
     price,
     quantity,
     specs:     [],
-    shipping:  [],
+    shipping,
   })
 
   const event = finalizeEvent({

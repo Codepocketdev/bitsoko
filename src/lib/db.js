@@ -94,6 +94,7 @@ export async function saveProduct(event) {
     images:     parsed.images      || [],
     stall_id:   parsed.stall_id    || '',
     quantity:   parsed.quantity    != null ? parsed.quantity : -1,
+    shipping:   parsed.shipping    || [],
     // Raw event for re-publishing
     raw: event,
   }

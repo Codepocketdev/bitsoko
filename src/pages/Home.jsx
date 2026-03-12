@@ -639,7 +639,7 @@ export default function Home() {
                 return (
                   <div
                     key={pubkey}
-                    onClick={() => navigate(`/profile?pubkey=${pubkey}`)}
+                    onClick={() => navigate(`/seller/${pubkey}`)}
                     style={{
                       background: C.white, borderRadius: 14,
                       border: `1px solid ${C.border}`,

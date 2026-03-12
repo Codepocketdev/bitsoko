@@ -1,1 +1,634 @@
-export default function CreateListing() { return <div style={{padding:'2rem'}}>CreateListing</div> }
+import { useState, useEffect, useRef } from 'react'
+import { useNavigate } from 'react-router-dom'
+import {
+  ArrowLeft, ArrowRight, Check, Upload, X,
+  Image as ImageIcon, Loader, Zap, Tag,
+  Package, Truck, AlertCircle, CheckCircle,
+  Plus, Minus
+} from 'lucide-react'
+import { publishProduct, uploadImage } from '../lib/nostrSync'
+
+const C = {
+  bg:     '#f7f4f0',
+  white:  '#ffffff',
+  black:  '#1a1410',
+  muted:  '#b0a496',
+  border: '#e8e0d5',
+  orange: '#f7931a',
+  ochre:  '#c8860a',
+  terra:  '#b5451b',
+  red:    '#ef4444',
+  green:  '#22c55e',
+}
+
+const CATEGORIES = [
+  'Electronics', 'Fashion', 'Food & Drinks', 'Art & Crafts',
+  'Home & Living', 'Books', 'Music', 'Wellness',
+  'Services', 'Collectibles', 'Sports', 'Other',
+]
+
+const STEPS = [
+  { id: 1, label: 'Photos',  icon: ImageIcon },
+  { id: 2, label: 'Details', icon: Tag       },
+  { id: 3, label: 'Price',   icon: Zap       },
+  { id: 4, label: 'Publish', icon: Check     },
+]
+
+// ── Draft key ─────────────────────────────────
+const DRAFT_KEY = 'bitsoko_listing_draft'
+
+const saveDraft = (data) => {
+  try { localStorage.setItem(DRAFT_KEY, JSON.stringify(data)) } catch {}
+}
+
+const loadDraft = () => {
+  try {
+    const raw = localStorage.getItem(DRAFT_KEY)
+    return raw ? JSON.parse(raw) : null
+  } catch { return null }
+}
+
+const clearDraft = () => {
+  try { localStorage.removeItem(DRAFT_KEY) } catch {}
+}
+
+// ── Step bar ──────────────────────────────────
+function StepBar({ current }) {
+  return (
+    <div style={{ display: 'flex', alignItems: 'center', padding: '0 20px', marginBottom: 28 }}>
+      {STEPS.map((step, i) => {
+        const done   = current > step.id
+        const active = current === step.id
+        const Icon   = step.icon
+        return (
+          <div key={step.id} style={{ display: 'flex', alignItems: 'center', flex: i < STEPS.length - 1 ? 1 : 0 }}>
+            <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 4 }}>
+              <div style={{
+                width: 36, height: 36, borderRadius: '50%',
+                background: done ? C.black : active ? C.ochre : C.border,
+                display: 'flex', alignItems: 'center', justifyContent: 'center',
+                transition: 'all .3s',
+              }}>
+                {done
+                  ? <Check size={16} color={C.white} strokeWidth={2.5}/>
+                  : <Icon size={16} color={active ? C.white : C.muted} strokeWidth={1.8}/>
+                }
+              </div>
+              <span style={{
+                fontSize: '0.6rem', fontWeight: active ? 700 : 400,
+                color: active ? C.ochre : done ? C.black : C.muted,
+                fontFamily: "'Inter',sans-serif", whiteSpace: 'nowrap',
+              }}>
+                {step.label}
+              </span>
+            </div>
+            {i < STEPS.length - 1 && (
+              <div style={{
+                flex: 1, height: 2, margin: '0 6px', marginBottom: 18,
+                background: done ? C.black : C.border,
+                transition: 'background .3s',
+              }}/>
+            )}
+          </div>
+        )
+      })}
+    </div>
+  )
+}
+
+// ── Step 1: Photos ────────────────────────────
+function PhotoStep({ images, setImages }) {
+  const [uploading, setUploading] = useState(false)
+  const [errMsg,    setErrMsg]    = useState('')
+  const inputRef = useRef()
+
+  const handleFiles = async (files) => {
+    const arr = Array.from(files).slice(0, 4 - images.length)
+    if (!arr.length) return
+    setUploading(true); setErrMsg('')
+    for (const file of arr) {
+      if (!file.type.startsWith('image/')) continue
+      if (file.size > 10 * 1024 * 1024) { setErrMsg('Max 10MB per image'); continue }
+      try {
+        const url = await uploadImage(file)
+        setImages(prev => [...prev, url])
+      } catch (e) {
+        setErrMsg(e.message || 'Upload failed')
+      }
+    }
+    setUploading(false)
+  }
+
+  return (
+    <div>
+      <div style={{ marginBottom: 20 }}>
+        <div style={{ fontSize: '1.2rem', fontWeight: 700, color: C.black, marginBottom: 4 }}>Product photos</div>
+        <div style={{ fontSize: '0.78rem', color: C.muted }}>Add up to 4 photos. First photo is your cover image.</div>
+      </div>
+
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginBottom: 16 }}>
+        {images.map((url, i) => (
+          <div key={url} style={{
+            aspectRatio: '1', borderRadius: 14, overflow: 'hidden',
+            position: 'relative', border: `2px solid ${i === 0 ? C.ochre : C.border}`,
+          }}>
+            <img src={url} alt="" style={{ width: '100%', height: '100%', objectFit: 'cover' }}/>
+            {i === 0 && (
+              <div style={{
+                position: 'absolute', top: 8, left: 8,
+                background: C.ochre, borderRadius: 99, padding: '2px 8px',
+                fontSize: '0.58rem', fontWeight: 700, color: C.white,
+                fontFamily: "'Inter',sans-serif",
+              }}>Cover</div>
+            )}
+            <button onClick={() => setImages(prev => prev.filter((_, idx) => idx !== i))}
+              style={{
+                position: 'absolute', top: 8, right: 8,
+                width: 26, height: 26, borderRadius: '50%',
+                background: 'rgba(0,0,0,0.6)', border: 'none',
+                display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer',
+              }}>
+              <X size={13} color={C.white}/>
+            </button>
+          </div>
+        ))}
+
+        {images.length < 4 && (
+          <button onClick={() => inputRef.current?.click()} disabled={uploading}
+            style={{
+              aspectRatio: '1', borderRadius: 14,
+              border: `2px dashed ${C.border}`, background: C.bg,
+              cursor: uploading ? 'not-allowed' : 'pointer',
+              display: 'flex', flexDirection: 'column',
+              alignItems: 'center', justifyContent: 'center', gap: 8,
+            }}>
+            {uploading
+              ? <Loader size={24} color={C.muted} style={{ animation: 'spin 1s linear infinite' }}/>
+              : <Upload size={24} color={C.muted}/>
+            }
+            <span style={{ fontSize: '0.72rem', color: C.muted, fontFamily: "'Inter',sans-serif" }}>
+              {uploading ? 'Uploading…' : 'Add photo'}
+            </span>
+          </button>
+        )}
+      </div>
+
+      {errMsg && (
+        <div style={{
+          display: 'flex', alignItems: 'center', gap: 8,
+          padding: '10px 14px', borderRadius: 10,
+          background: 'rgba(239,68,68,0.06)', border: `1px solid rgba(239,68,68,0.2)`,
+          fontSize: '0.75rem', color: C.red, fontFamily: "'Inter',sans-serif",
+        }}>
+          <AlertCircle size={14}/> {errMsg}
+        </div>
+      )}
+
+      <input ref={inputRef} type="file" accept="image/*" multiple
+        onChange={e => handleFiles(e.target.files)} style={{ display: 'none' }}/>
+    </div>
+  )
+}
+
+// ── Step 2: Details ───────────────────────────
+function DetailsStep({ name, setName, description, setDescription, categories, setCategories }) {
+  const toggle = (cat) =>
+    setCategories(prev => prev.includes(cat) ? prev.filter(c => c !== cat) : [...prev, cat])
+
+  return (
+    <div>
+      <div style={{ marginBottom: 20 }}>
+        <div style={{ fontSize: '1.2rem', fontWeight: 700, color: C.black, marginBottom: 4 }}>Product details</div>
+        <div style={{ fontSize: '0.78rem', color: C.muted }}>Help buyers find and understand your product.</div>
+      </div>
+
+      <div style={{ marginBottom: 18 }}>
+        <label style={{ display: 'block', fontSize: '0.78rem', fontWeight: 600, color: C.black, marginBottom: 8, fontFamily: "'Inter',sans-serif" }}>
+          Product name *
+        </label>
+        <input value={name} onChange={e => setName(e.target.value)}
+          placeholder="e.g. Handmade leather wallet" maxLength={100}
+          style={{
+            width: '100%', padding: '12px 14px', background: C.white,
+            border: `1.5px solid ${name ? C.black : C.border}`, borderRadius: 12,
+            outline: 'none', fontSize: '0.9rem', color: C.black,
+            fontFamily: "'Inter',sans-serif", boxSizing: 'border-box', transition: 'border-color .2s',
+          }}/>
+        <div style={{ textAlign: 'right', fontSize: '0.65rem', color: C.muted, marginTop: 4, fontFamily: "'Inter',sans-serif" }}>
+          {name.length}/100
+        </div>
+      </div>
+
+      <div style={{ marginBottom: 18 }}>
+        <label style={{ display: 'block', fontSize: '0.78rem', fontWeight: 600, color: C.black, marginBottom: 8, fontFamily: "'Inter',sans-serif" }}>
+          Description *
+        </label>
+        <textarea value={description} onChange={e => setDescription(e.target.value)}
+          placeholder="Describe your product — material, size, condition, story…"
+          maxLength={1000} rows={5}
+          style={{
+            width: '100%', padding: '12px 14px', background: C.white,
+            border: `1.5px solid ${description ? C.black : C.border}`, borderRadius: 12,
+            outline: 'none', resize: 'none', fontSize: '0.88rem', color: C.black,
+            lineHeight: 1.6, fontFamily: "'Inter',sans-serif",
+            boxSizing: 'border-box', transition: 'border-color .2s',
+          }}/>
+        <div style={{ textAlign: 'right', fontSize: '0.65rem', color: C.muted, marginTop: 4, fontFamily: "'Inter',sans-serif" }}>
+          {description.length}/1000
+        </div>
+      </div>
+
+      <div>
+        <label style={{ display: 'block', fontSize: '0.78rem', fontWeight: 600, color: C.black, marginBottom: 10, fontFamily: "'Inter',sans-serif" }}>
+          Category tags
+        </label>
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+          {CATEGORIES.map(cat => {
+            const active = categories.includes(cat)
+            return (
+              <button key={cat} onClick={() => toggle(cat)} style={{
+                padding: '7px 14px', borderRadius: 99,
+                background: active ? C.black : C.white,
+                border: `1.5px solid ${active ? C.black : C.border}`,
+                cursor: 'pointer', fontSize: '0.75rem',
+                fontWeight: active ? 700 : 400,
+                color: active ? C.white : C.black,
+                fontFamily: "'Inter',sans-serif", transition: 'all .15s',
+              }}>
+                {cat}
+              </button>
+            )
+          })}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ── Step 3: Price ─────────────────────────────
+function PriceStep({ price, setPrice, quantity, setQuantity, shipping, setShipping }) {
+  const ksh = price ? Math.round((parseInt(price) / 100_000_000) * 13_000_000) : 0
+
+  const addShipping    = () => setShipping(prev => [...prev, { name: '', cost: '', regions: '' }])
+  const removeShipping = (i) => setShipping(prev => prev.filter((_, idx) => idx !== i))
+  const updateShipping = (i, field, val) =>
+    setShipping(prev => prev.map((s, idx) => idx === i ? { ...s, [field]: val } : s))
+
+  return (
+    <div>
+      <div style={{ marginBottom: 20 }}>
+        <div style={{ fontSize: '1.2rem', fontWeight: 700, color: C.black, marginBottom: 4 }}>Pricing & stock</div>
+        <div style={{ fontSize: '0.78rem', color: C.muted }}>Set your price in sats and manage inventory.</div>
+      </div>
+
+      <div style={{ marginBottom: 18 }}>
+        <label style={{ display: 'block', fontSize: '0.78rem', fontWeight: 600, color: C.black, marginBottom: 8, fontFamily: "'Inter',sans-serif" }}>
+          Price (sats) *
+        </label>
+        <div style={{ position: 'relative' }}>
+          <div style={{ position: 'absolute', left: 14, top: '50%', transform: 'translateY(-50%)' }}>
+            <Zap size={15} fill={C.orange} color={C.orange}/>
+          </div>
+          <input type="number" min="1" value={price} onChange={e => setPrice(e.target.value)}
+            placeholder="e.g. 50000"
+            style={{
+              width: '100%', padding: '12px 14px 12px 36px', background: C.white,
+              border: `1.5px solid ${price ? C.black : C.border}`, borderRadius: 12,
+              outline: 'none', fontSize: '1rem', fontWeight: 600, color: C.black,
+              fontFamily: "'Inter',sans-serif", boxSizing: 'border-box', transition: 'border-color .2s',
+            }}/>
+        </div>
+        {price && (
+          <div style={{ fontSize: '0.72rem', color: C.muted, marginTop: 6, fontFamily: "'Inter',sans-serif" }}>
+            ≈ KSh {ksh.toLocaleString()} at current rate
+          </div>
+        )}
+      </div>
+
+      <div style={{ marginBottom: 24 }}>
+        <label style={{ display: 'block', fontSize: '0.78rem', fontWeight: 600, color: C.black, marginBottom: 8, fontFamily: "'Inter',sans-serif" }}>
+          Quantity
+        </label>
+        <div style={{ display: 'flex', alignItems: 'center' }}>
+          <button onClick={() => setQuantity(q => Math.max(-1, q - 1))} style={{
+            width: 44, height: 44, borderRadius: '12px 0 0 12px',
+            background: C.white, border: `1.5px solid ${C.border}`, borderRight: 'none',
+            cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center',
+          }}>
+            <Minus size={16} color={C.black}/>
+          </button>
+          <div style={{
+            flex: 1, height: 44, background: C.white, border: `1.5px solid ${C.border}`,
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+            fontSize: '0.9rem', fontWeight: 700, color: C.black, fontFamily: "'Inter',sans-serif",
+          }}>
+            {quantity === -1 ? 'Unlimited' : quantity}
+          </div>
+          <button onClick={() => setQuantity(q => q === -1 ? 1 : q + 1)} style={{
+            width: 44, height: 44, borderRadius: '0 12px 12px 0',
+            background: C.white, border: `1.5px solid ${C.border}`, borderLeft: 'none',
+            cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center',
+          }}>
+            <Plus size={16} color={C.black}/>
+          </button>
+        </div>
+        <div style={{ fontSize: '0.68rem', color: C.muted, marginTop: 6, fontFamily: "'Inter',sans-serif" }}>
+          Set to Unlimited for digital goods or services
+        </div>
+      </div>
+
+      <div>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
+          <label style={{ fontSize: '0.78rem', fontWeight: 600, color: C.black, fontFamily: "'Inter',sans-serif" }}>
+            Shipping options
+          </label>
+          <button onClick={addShipping} style={{
+            display: 'flex', alignItems: 'center', gap: 4,
+            background: 'none', border: 'none', cursor: 'pointer',
+            fontSize: '0.75rem', fontWeight: 600, color: C.ochre, fontFamily: "'Inter',sans-serif",
+          }}>
+            <Plus size={14}/> Add
+          </button>
+        </div>
+
+        {shipping.length === 0 && (
+          <div style={{
+            padding: '14px', borderRadius: 12, background: C.bg,
+            border: `1px dashed ${C.border}`, textAlign: 'center',
+            fontSize: '0.75rem', color: C.muted, fontFamily: "'Inter',sans-serif",
+          }}>
+            No shipping options — tap Add for physical products
+          </div>
+        )}
+
+        {shipping.map((s, i) => (
+          <div key={i} style={{
+            background: C.white, border: `1px solid ${C.border}`,
+            borderRadius: 12, padding: '14px', marginBottom: 10,
+          }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 10 }}>
+              <span style={{ fontSize: '0.75rem', fontWeight: 600, color: C.black, fontFamily: "'Inter',sans-serif" }}>
+                Option {i + 1}
+              </span>
+              <button onClick={() => removeShipping(i)} style={{ background: 'none', border: 'none', cursor: 'pointer' }}>
+                <X size={15} color={C.muted}/>
+              </button>
+            </div>
+            {[
+              { field: 'name',    placeholder: 'e.g. Nairobi CBD pickup, DHL Kenya' },
+              { field: 'cost',    placeholder: 'Cost in sats (0 for free)'          },
+              { field: 'regions', placeholder: 'Regions (e.g. Nairobi, Kenya, EA)'  },
+            ].map(({ field, placeholder }) => (
+              <input key={field} value={s[field]} onChange={e => updateShipping(i, field, e.target.value)}
+                placeholder={placeholder}
+                style={{
+                  width: '100%', padding: '9px 12px', marginBottom: 8,
+                  background: C.bg, border: `1px solid ${C.border}`, borderRadius: 8,
+                  outline: 'none', fontSize: '0.8rem', color: C.black,
+                  fontFamily: "'Inter',sans-serif", boxSizing: 'border-box',
+                }}/>
+            ))}
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+// ── Step 4: Publish ───────────────────────────
+function PublishStep({ images, name, description, categories, price, quantity, shipping, status, errMsg }) {
+  const ksh = price ? Math.round((parseInt(price) / 100_000_000) * 13_000_000) : 0
+  return (
+    <div>
+      <div style={{ marginBottom: 20 }}>
+        <div style={{ fontSize: '1.2rem', fontWeight: 700, color: C.black, marginBottom: 4 }}>Review & publish</div>
+        <div style={{ fontSize: '0.78rem', color: C.muted }}>Everything look good? Hit publish to go live on Bitsoko.</div>
+      </div>
+
+      {images[0] && (
+        <div style={{ width: '100%', aspectRatio: '16/9', borderRadius: 14, overflow: 'hidden', marginBottom: 16, border: `1px solid ${C.border}` }}>
+          <img src={images[0]} alt={name} style={{ width: '100%', height: '100%', objectFit: 'cover' }}/>
+        </div>
+      )}
+
+      <div style={{ background: C.white, borderRadius: 14, border: `1px solid ${C.border}`, padding: '16px', marginBottom: 16 }}>
+        <div style={{ fontSize: '1rem', fontWeight: 700, color: C.black, marginBottom: 6 }}>{name}</div>
+        <div style={{ fontSize: '0.8rem', color: C.muted, lineHeight: 1.5, marginBottom: 12 }}>{description}</div>
+        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 12 }}>
+          {categories.map(c => (
+            <span key={c} style={{
+              padding: '4px 10px', borderRadius: 99, background: C.bg,
+              border: `1px solid ${C.border}`, fontSize: '0.68rem', color: C.black,
+              fontFamily: "'Inter',sans-serif",
+            }}>{c}</span>
+          ))}
+        </div>
+        <div style={{ display: 'flex', gap: 20 }}>
+          <div>
+            <div style={{ fontSize: '0.65rem', color: C.muted, marginBottom: 2 }}>Price</div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: '0.95rem', fontWeight: 700, color: C.black }}>
+              <Zap size={13} fill={C.orange} color={C.orange}/> {parseInt(price).toLocaleString()} sats
+            </div>
+            <div style={{ fontSize: '0.65rem', color: C.muted }}>≈ KSh {ksh.toLocaleString()}</div>
+          </div>
+          <div>
+            <div style={{ fontSize: '0.65rem', color: C.muted, marginBottom: 2 }}>Stock</div>
+            <div style={{ fontSize: '0.95rem', fontWeight: 700, color: C.black }}>
+              {quantity === -1 ? 'Unlimited' : quantity}
+            </div>
+          </div>
+          {shipping.length > 0 && (
+            <div>
+              <div style={{ fontSize: '0.65rem', color: C.muted, marginBottom: 2 }}>Shipping</div>
+              <div style={{ fontSize: '0.95rem', fontWeight: 700, color: C.black }}>
+                {shipping.length} option{shipping.length !== 1 ? 's' : ''}
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+
+      {images.length > 1 && (
+        <div style={{ display: 'flex', gap: 8, marginBottom: 16 }}>
+          {images.slice(1).map((url, i) => (
+            <div key={i} style={{ width: 64, height: 64, borderRadius: 10, overflow: 'hidden', border: `1px solid ${C.border}` }}>
+              <img src={url} alt="" style={{ width: '100%', height: '100%', objectFit: 'cover' }}/>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {status === 'publishing' && (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '14px', borderRadius: 12, background: 'rgba(200,134,10,0.06)', border: `1px solid rgba(200,134,10,0.2)`, fontSize: '0.8rem', color: C.ochre, fontFamily: "'Inter',sans-serif" }}>
+          <Loader size={16} style={{ animation: 'spin 1s linear infinite', flexShrink: 0 }}/> Publishing to Nostr relays…
+        </div>
+      )}
+      {status === 'done' && (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '14px', borderRadius: 12, background: 'rgba(34,197,94,0.06)', border: `1px solid rgba(34,197,94,0.2)`, fontSize: '0.8rem', color: C.green, fontFamily: "'Inter',sans-serif" }}>
+          <CheckCircle size={16} style={{ flexShrink: 0 }}/> Published! Redirecting to your shop…
+        </div>
+      )}
+      {status === 'error' && (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '14px', borderRadius: 12, background: 'rgba(239,68,68,0.06)', border: `1px solid rgba(239,68,68,0.2)`, fontSize: '0.8rem', color: C.red, fontFamily: "'Inter',sans-serif" }}>
+          <AlertCircle size={16} style={{ flexShrink: 0 }}/> {errMsg}
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ── Main ──────────────────────────────────────
+export default function CreateListing() {
+  const navigate = useNavigate()
+
+  // ── Restore draft on mount ────────────────
+  const draft = loadDraft()
+
+  const [step,        setStep]        = useState(draft?.step        ?? 1)
+  const [images,      setImages]      = useState(draft?.images      ?? [])
+  const [name,        setName]        = useState(draft?.name        ?? '')
+  const [description, setDescription] = useState(draft?.description ?? '')
+  const [categories,  setCategories]  = useState(draft?.categories  ?? [])
+  const [price,       setPrice]       = useState(draft?.price       ?? '')
+  const [quantity,    setQuantity]    = useState(draft?.quantity     ?? -1)
+  const [shipping,    setShipping]    = useState(draft?.shipping     ?? [])
+  const [status,      setStatus]      = useState('idle')
+  const [errMsg,      setErrMsg]      = useState('')
+
+  // ── Auto-save draft on every change ──────
+  useEffect(() => {
+    saveDraft({ step, images, name, description, categories, price, quantity, shipping })
+  }, [step, images, name, description, categories, price, quantity, shipping])
+
+  const canNext = () => {
+    if (step === 1) return images.length > 0
+    if (step === 2) return name.trim().length > 0 && description.trim().length > 0
+    if (step === 3) return parseInt(price) > 0
+    return false
+  }
+
+  const next = () => { if (canNext()) setStep(s => s + 1) }
+  const back = () => setStep(s => s - 1)
+
+  const publish = async () => {
+    if (status === 'publishing' || status === 'done') return
+    setStatus('publishing'); setErrMsg('')
+    try {
+      await publishProduct({
+        name:        name.trim(),
+        description: description.trim(),
+        price:       parseInt(price),
+        images, quantity, categories, shipping,
+        stall_id: `stall-${localStorage.getItem('bitsoko_npub')?.slice(0, 8) || 'default'}`,
+      })
+      setStatus('done')
+      clearDraft()  // ← wipe draft after successful publish
+      setTimeout(() => navigate('/shop'), 1800)
+    } catch (e) {
+      setErrMsg(e.message || 'Publish failed — check your connection')
+      setStatus('error')
+    }
+  }
+
+  return (
+    <div style={{ background: C.bg, minHeight: '100vh', fontFamily: "'Inter',sans-serif" }}>
+
+      {/* Header */}
+      <div style={{
+        background: C.white, borderBottom: `1px solid ${C.border}`,
+        padding: '16px 20px',
+        display: 'flex', alignItems: 'center', gap: 14,
+        position: 'sticky', top: 0, zIndex: 50,
+      }}>
+        <button onClick={() => step === 1 ? navigate(-1) : back()} style={{
+          width: 36, height: 36, borderRadius: '50%',
+          background: C.bg, border: `1px solid ${C.border}`,
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+          cursor: 'pointer', flexShrink: 0,
+        }}>
+          <ArrowLeft size={17} color={C.black}/>
+        </button>
+        <div style={{ flex: 1 }}>
+          <div style={{ fontSize: '1rem', fontWeight: 700, color: C.black }}>New listing</div>
+          <div style={{ fontSize: '0.68rem', color: C.muted }}>Step {step} of {STEPS.length}</div>
+        </div>
+        {/* Draft indicator */}
+        {(name || images.length > 0) && status === 'idle' && (
+          <div style={{
+            fontSize: '0.65rem', color: C.muted,
+            fontFamily: "'Inter',sans-serif",
+            display: 'flex', alignItems: 'center', gap: 4,
+          }}>
+            <div style={{ width: 6, height: 6, borderRadius: '50%', background: C.green }}/>
+            Draft saved
+          </div>
+        )}
+      </div>
+
+      <div style={{ padding: '24px 20px 160px' }}>
+        <StepBar current={step}/>
+        {step === 1 && <PhotoStep images={images} setImages={setImages}/>}
+        {step === 2 && <DetailsStep name={name} setName={setName} description={description} setDescription={setDescription} categories={categories} setCategories={setCategories}/>}
+        {step === 3 && <PriceStep price={price} setPrice={setPrice} quantity={quantity} setQuantity={setQuantity} shipping={shipping} setShipping={setShipping}/>}
+        {step === 4 && <PublishStep images={images} name={name} description={description} categories={categories} price={price} quantity={quantity} shipping={shipping} status={status} errMsg={errMsg}/>}
+      </div>
+
+      {/* Action bar — sits above BottomNav */}
+      <div style={{
+        position: 'fixed', bottom: '64px', left: 0, right: 0,
+        background: C.white, borderTop: `1px solid ${C.border}`,
+        padding: '16px 20px',
+        display: 'flex', gap: 12,
+        boxShadow: '0 -4px 16px rgba(26,20,16,0.06)',
+      }}>
+        {step > 1 && (
+          <button onClick={back} style={{
+            flex: 1, padding: '14px', background: C.bg,
+            border: `1.5px solid ${C.border}`, borderRadius: 14, cursor: 'pointer',
+            fontSize: '0.88rem', fontWeight: 600, color: C.black,
+            display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6,
+          }}>
+            <ArrowLeft size={16}/> Back
+          </button>
+        )}
+
+        {step < 4 && (
+          <button onClick={next} disabled={!canNext()} style={{
+            flex: 2, padding: '14px',
+            background: canNext() ? C.black : C.border,
+            border: 'none', borderRadius: 14,
+            cursor: canNext() ? 'pointer' : 'not-allowed',
+            fontSize: '0.88rem', fontWeight: 700,
+            color: canNext() ? C.white : C.muted,
+            display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6,
+            transition: 'all .2s',
+          }}>
+            Continue <ArrowRight size={16}/>
+          </button>
+        )}
+
+        {step === 4 && (
+          <button onClick={publish} disabled={status === 'publishing' || status === 'done'} style={{
+            flex: 2, padding: '14px',
+            background: status === 'done' ? C.green : C.black,
+            border: 'none', borderRadius: 14,
+            cursor: status === 'publishing' || status === 'done' ? 'not-allowed' : 'pointer',
+            fontSize: '0.88rem', fontWeight: 700, color: C.white,
+            display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8,
+            transition: 'all .2s',
+          }}>
+            {status === 'publishing'
+              ? <><Loader size={16} style={{ animation: 'spin 1s linear infinite' }}/> Publishing…</>
+              : status === 'done'
+              ? <><CheckCircle size={16}/> Published!</>
+              : <><Zap size={16} fill={C.white} color={C.white}/> Publish listing</>
+            }
+          </button>
+        )}
+      </div>
+
+      <style>{`@keyframes spin { to { transform: rotate(360deg) } }`}</style>
+    </div>
+  )
+}
+

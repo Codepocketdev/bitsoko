@@ -10,6 +10,7 @@ import Explore       from './pages/Explore'
 import Deals         from './pages/Deals'
 import Cart          from './pages/Cart'
 import Profile       from './pages/Profile'
+import SellerProfile from './pages/SellerProfile'
 import Orders        from './pages/Orders'
 import Messages      from './pages/Messages'
 import Settings      from './pages/Settings'
@@ -57,22 +58,30 @@ export default function App() {
 
   return (
     <BrowserRouter>
-      <PageWrapper toggleTheme={toggleTheme} theme={theme}>
-        <Routes>
-          <Route path="/"               element={<Home />} />
-          <Route path="/explore"        element={<Explore />} />
-          <Route path="/deals"          element={<Deals />} />
-          <Route path="/cart"           element={<Cart />} />
-          <Route path="/profile"        element={<Profile />} />
-          <Route path="/orders"         element={<Orders />} />
-          <Route path="/messages"       element={<Messages />} />
-          <Route path="/settings"       element={<Settings />} />
-          <Route path="/shop"           element={<MyShop />} />
-          <Route path="/create-listing" element={<CreateListing />} />
-          <Route path="/product/:id"    element={<ProductDetail />} />
-          <Route path="*"               element={<Navigate to="/" replace />} />
-        </Routes>
-      </PageWrapper>
+      <Routes>
+        {/* Full-screen pages — no BottomNav */}
+        <Route path="/create-listing" element={<CreateListing />} />
+        <Route path="/product/:id"    element={<ProductDetail />} />
+        <Route path="/profile"        element={<Profile />} />
+        <Route path="/seller/:pubkey" element={<SellerProfile />} />
+
+        {/* App shell — all other pages get BottomNav */}
+        <Route path="*" element={
+          <PageWrapper toggleTheme={toggleTheme} theme={theme}>
+            <Routes>
+              <Route path="/"          element={<Home />} />
+              <Route path="/explore"   element={<Explore />} />
+              <Route path="/deals"     element={<Deals />} />
+              <Route path="/cart"      element={<Cart />} />
+              <Route path="/orders"    element={<Orders />} />
+              <Route path="/messages"  element={<Messages />} />
+              <Route path="/settings"  element={<Settings />} />
+              <Route path="/shop"      element={<MyShop />} />
+              <Route path="*"          element={<Navigate to="/" replace />} />
+            </Routes>
+          </PageWrapper>
+        }/>
+      </Routes>
     </BrowserRouter>
   )
 }
