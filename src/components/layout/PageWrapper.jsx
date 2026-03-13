@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { useLocation, useNavigate } from 'react-router-dom'
 import {
   Home, Search, Tag, ShoppingCart, Menu,
@@ -45,10 +45,22 @@ const C = {
 }
 
 function MoreSheet({ onClose, navigate, currentPath }) {
-  const displayName = localStorage.getItem('bitsoko_display_name') || 'Anon'
-  const ln          = localStorage.getItem('bitsoko_ln')           || ''
-  const npub        = localStorage.getItem('bitsoko_npub')         || ''
-  const shortNpub   = npub ? `${npub.slice(0,10)}…${npub.slice(-4)}` : ''
+  const [displayName, setDisplayName] = useState(localStorage.getItem('bitsoko_display_name') || 'Anon')
+  const [ln,          setLn]          = useState(localStorage.getItem('bitsoko_ln') || '')
+  const npub      = localStorage.getItem('bitsoko_npub') || ''
+  const shortNpub = npub ? `${npub.slice(0,10)}…${npub.slice(-4)}` : ''
+
+  // Update when profile fetch completes in background
+  useEffect(() => {
+    const onStorage = () => {
+      const n = localStorage.getItem('bitsoko_display_name')
+      const l = localStorage.getItem('bitsoko_ln')
+      if (n) setDisplayName(n)
+      if (l) setLn(l)
+    }
+    window.addEventListener('storage', onStorage)
+    return () => window.removeEventListener('storage', onStorage)
+  }, [])
 
   const handleNav = (path) => {
     navigate(path)
@@ -391,6 +403,15 @@ export default function PageWrapper({ children }) {
   const [showMore, setShowMore] = useState(false)
   const navigate  = useNavigate()
   const location  = useLocation()
+
+  // Reopen More sheet when navigating back from Profile/Shop/etc
+  useEffect(() => {
+    if (location.state?.openMore) {
+      setShowMore(true)
+      // Clear the state so refresh doesn't reopen it
+      window.history.replaceState({}, '')
+    }
+  }, [location.state])
 
   return (
     <div style={{ minHeight: '100vh', background: C.bg }}>

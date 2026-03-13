@@ -7,7 +7,8 @@ import {
   RefreshCw, Loader, Plus, ShoppingBag
 } from 'lucide-react'
 import { openDB, getProducts, getProfile, getProfiles } from '../lib/db'
-import { fetchAndSeed, startSync, stopSync } from '../lib/nostrSync'
+import { fetchAndSeed, startSync, stopSync, getPublicKeyHex } from '../lib/nostrSync'
+import { useNostrProfile } from '../hooks/useNostrProfile'
 
 // ── Design tokens ─────────────────────────────
 const C = {
@@ -36,7 +37,6 @@ const CATEGORIES = [
 
 // ── Helpers ───────────────────────────────────
 function satsToKsh(sats) {
-  // rough rate: 1 BTC ≈ 13M KSh (update via API later)
   const btcKsh = 13_000_000
   const ksh = (sats / 100_000_000) * btcKsh
   if (ksh >= 1000) return `KSh ${(ksh / 1000).toFixed(1)}k`
@@ -84,10 +84,10 @@ function Avatar({ profile, pubkey, size = 36 }) {
 
 // ── Product Card ──────────────────────────────
 function ProductCard({ product, profile, onClick }) {
-  const image     = product.images?.[0]
-  const hasImage  = !!image
-  const name      = product.name        || 'Untitled'
-  const price     = product.price       || 0
+  const image      = product.images?.[0]
+  const hasImage   = !!image
+  const name       = product.name  || 'Untitled'
+  const price      = product.price || 0
   const sellerName = profile?.name || profile?.display_name || product.pubkey?.slice(0, 8) + '…'
 
   return (
@@ -100,19 +100,17 @@ function ProductCard({ product, profile, onClick }) {
         boxShadow: '0 2px 8px rgba(26,20,16,0.04)',
       }}
       onMouseEnter={e => {
-        e.currentTarget.style.transform   = 'translateY(-2px)'
-        e.currentTarget.style.boxShadow   = '0 6px 20px rgba(26,20,16,0.10)'
+        e.currentTarget.style.transform = 'translateY(-2px)'
+        e.currentTarget.style.boxShadow = '0 6px 20px rgba(26,20,16,0.10)'
       }}
       onMouseLeave={e => {
-        e.currentTarget.style.transform   = 'translateY(0)'
-        e.currentTarget.style.boxShadow   = '0 2px 8px rgba(26,20,16,0.04)'
+        e.currentTarget.style.transform = 'translateY(0)'
+        e.currentTarget.style.boxShadow = '0 2px 8px rgba(26,20,16,0.04)'
       }}
     >
-      {/* Image */}
       <div style={{
         width: '100%', aspectRatio: '1',
-        background: C.bg, position: 'relative',
-        overflow: 'hidden',
+        background: C.bg, position: 'relative', overflow: 'hidden',
       }}>
         {hasImage ? (
           <img
@@ -128,11 +126,9 @@ function ProductCard({ product, profile, onClick }) {
             <Store size={28} color="rgba(26,20,16,0.12)"/>
           </div>
         )}
-        {/* Price badge */}
         <div style={{
           position: 'absolute', bottom: 8, left: 8,
-          background: 'rgba(26,20,16,0.85)',
-          backdropFilter: 'blur(4px)',
+          background: 'rgba(26,20,16,0.85)', backdropFilter: 'blur(4px)',
           borderRadius: 99, padding: '3px 8px',
           display: 'flex', alignItems: 'center', gap: 4,
         }}>
@@ -146,27 +142,19 @@ function ProductCard({ product, profile, onClick }) {
         </div>
       </div>
 
-      {/* Info */}
       <div style={{ padding: '10px 12px 12px' }}>
         <div style={{
           fontFamily: "'Inter',sans-serif",
           fontSize: '0.82rem', fontWeight: 600,
           color: C.black, marginBottom: 2,
-          overflow: 'hidden', textOverflow: 'ellipsis',
-          whiteSpace: 'nowrap',
+          overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
         }}>
           {name}
         </div>
-        <div style={{
-          fontFamily: "'Inter',sans-serif",
-          fontSize: '0.68rem', color: C.muted,
-          marginBottom: 6,
-        }}>
+        <div style={{ fontFamily: "'Inter',sans-serif", fontSize: '0.68rem', color: C.muted, marginBottom: 6 }}>
           {satsToKsh(price)}
         </div>
-        <div style={{
-          display: 'flex', alignItems: 'center', gap: 5,
-        }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
           <Avatar profile={profile} pubkey={product.pubkey} size={16}/>
           <span style={{
             fontFamily: "'Inter',sans-serif",
@@ -185,20 +173,51 @@ function ProductCard({ product, profile, onClick }) {
 export default function Home() {
   const navigate = useNavigate()
 
-  const [products,      setProducts]      = useState([])
-  const [profiles,      setProfiles]      = useState({})
-  const [loading,       setLoading]       = useState(true)
-  const [syncing,       setSyncing]       = useState(false)
-  const [newCount,      setNewCount]      = useState(0)
-  const [selectedCat,   setSelectedCat]   = useState(null)
-  const [searchQuery,   setSearchQuery]   = useState('')
+  const [products,    setProducts]    = useState([])
+  const [profiles,    setProfiles]    = useState({})
+  const [loading,     setLoading]     = useState(true)
+  const [syncing,     setSyncing]     = useState(false)
+  const [newCount,    setNewCount]    = useState(0)
+  const [selectedCat, setSelectedCat] = useState(null)
+  const [searchQuery, setSearchQuery] = useState('')
 
-  const displayName = localStorage.getItem('bitsoko_display_name') || 'there'
+  // ── Display name: useNostrProfile hook (IndexedDB first, relay second)
+  // Same pattern as Profile page — no waiting, no flash, works on re-login
+  const _pubkeyHex = (() => { try { return getPublicKeyHex() } catch { return '' } })()
+  const { profile: _userProfile } = useNostrProfile(_pubkeyHex)
+
+  // null  = still resolving (show nothing)
+  // string = resolved (show name, or 'there' if not found)
+  const [displayName, setDisplayName] = useState(
+    () => localStorage.getItem('bitsoko_display_name') || null
+  )
+
+  // Update name when hook resolves from IndexedDB (instant) or relay (fresh)
+  useEffect(() => {
+    if (!_userProfile) return
+    const n = _userProfile.display_name || _userProfile.name
+    if (n) {
+      setDisplayName(n)
+      localStorage.setItem('bitsoko_display_name', n)
+    } else {
+      // Profile fetched but no name — now safe to show fallback
+      setDisplayName(prev => prev || 'there')
+    }
+  }, [_userProfile])
+
+  // Also catch same-tab bitsoko_login event as an instant fallback
+  useEffect(() => {
+    const onLogin = () => {
+      const n = localStorage.getItem('bitsoko_display_name')
+      if (n) setDisplayName(n)
+    }
+    window.addEventListener('bitsoko_login', onLogin)
+    return () => window.removeEventListener('bitsoko_login', onLogin)
+  }, [])
 
   // ── Cycling banner ────────────────────────
   const BANNERS = [
     {
-      // Card 1 — Coral + cream. Pulled from the big circle in the illustration.
       bg:     '#e8614a',
       accent: '#fdf0e8',
       tag:    'LIGHTNING DEALS',
@@ -208,7 +227,6 @@ export default function Home() {
       bubble: 'rgba(253,240,232,0.15)',
     },
     {
-      // Card 2 — Bitcoin gold + dark. Coin color from the illustration.
       bg:     '#f5a623',
       accent: '#1a1410',
       tag:    'BITCOIN PAYMENTS',
@@ -218,7 +236,6 @@ export default function Home() {
       bubble: 'rgba(26,20,16,0.08)',
     },
     {
-      // Card 3 — Ocean blue + cream. Blue bag from the illustration.
       bg:     '#4a7fc1',
       accent: '#fdf0e8',
       tag:    'LOCAL SELLERS',
@@ -228,7 +245,6 @@ export default function Home() {
       bubble: 'rgba(253,240,232,0.12)',
     },
     {
-      // Card 4 — Teal + cream. Teal bag from the illustration.
       bg:     '#4ab8a0',
       accent: '#fdf0e8',
       tag:    'NEW ARRIVALS',
@@ -238,7 +254,6 @@ export default function Home() {
       bubble: 'rgba(253,240,232,0.12)',
     },
     {
-      // Card 5 — Deep coral-red + gold. Red bag + coin combo from illustration.
       bg:     '#e85d3a',
       accent: '#f5a623',
       tag:    'START SELLING',
@@ -255,14 +270,13 @@ export default function Home() {
     return () => clearInterval(t)
   }, [])
 
-  // ── Load from IndexedDB first (instant, no loading state) ──
+  // ── Load from IndexedDB first ──
   const loadFromDB = useCallback(async () => {
     await openDB()
     const saved = await getProducts(100)
     if (saved.length > 0) {
       setProducts(saved)
       setLoading(false)
-      // Fetch profiles for products we have
       const pubkeys = [...new Set(saved.map(p => p.pubkey))]
       const profs   = await getProfiles(pubkeys)
       const profMap = {}
@@ -276,18 +290,14 @@ export default function Home() {
     let mounted = true
 
     const init = async () => {
-      // 1. Load whatever is in IndexedDB immediately
       await loadFromDB()
 
-      // 2. Fetch fresh data from relays (seeds IndexedDB)
       setSyncing(true)
       await fetchAndSeed({
         onProduct: async (event) => {
           if (!mounted) return
-          // Reload products from DB after each new one lands
           const updated = await getProducts(100)
           setProducts(updated)
-          // Fetch this seller's profile if missing
           const prof = await getProfile(event.pubkey)
           if (prof) setProfiles(prev => ({ ...prev, [event.pubkey]: prof }))
         },
@@ -307,12 +317,10 @@ export default function Home() {
         },
       })
 
-      // 3. Start live WebSocket subscription for new products
       startSync({
         onProduct: async (event) => {
           if (!mounted) return
           if (event._deleted) {
-            // Product was deleted — remove from UI
             setProducts(prev => prev.filter(p => p.id !== event.id))
             return
           }
@@ -356,7 +364,7 @@ export default function Home() {
     return true
   })
 
-  const recent  = filtered.slice(0, 6)
+  const recent = filtered.slice(0, 6)
   const topSellers = Object.values(
     products.reduce((acc, p) => {
       if (!acc[p.pubkey]) acc[p.pubkey] = { pubkey: p.pubkey, count: 0 }
@@ -370,8 +378,7 @@ export default function Home() {
 
       {/* ── Topbar ── */}
       <div style={{
-        background: C.white,
-        borderBottom: `1px solid ${C.border}`,
+        background: C.white, borderBottom: `1px solid ${C.border}`,
         padding: '16px 20px 12px',
         position: 'sticky', top: 0, zIndex: 50,
       }}>
@@ -379,14 +386,17 @@ export default function Home() {
           <div>
             <div style={{ fontSize: '0.72rem', color: C.muted }}>Good day,</div>
             <div style={{ fontSize: '1.1rem', fontWeight: 700, color: C.black }}>
-              {displayName}
+              {displayName === null
+                ? <span style={{ display: 'inline-block', width: 80, height: 16, borderRadius: 6, background: C.white, verticalAlign: 'middle' }} />
+                : displayName
+              }
             </div>
           </div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
             {syncing && <Loader size={16} color={C.muted} style={{ animation: 'spin 1s linear infinite' }}/>}
             {newCount > 0 && (
               <button
-                onClick={() => { setNewCount(0) }}
+                onClick={() => setNewCount(0)}
                 style={{
                   background: C.orange, border: 'none', borderRadius: 99,
                   padding: '4px 10px', cursor: 'pointer',
@@ -397,20 +407,18 @@ export default function Home() {
                 <RefreshCw size={10}/> {newCount} new
               </button>
             )}
-            <button
-              style={{
-                width: 36, height: 36, borderRadius: '50%',
-                background: C.bg, border: `1px solid ${C.border}`,
-                display: 'flex', alignItems: 'center', justifyContent: 'center',
-                cursor: 'pointer',
-              }}
-            >
+            <button style={{
+              width: 36, height: 36, borderRadius: '50%',
+              background: C.bg, border: `1px solid ${C.border}`,
+              display: 'flex', alignItems: 'center', justifyContent: 'center',
+              cursor: 'pointer',
+            }}>
               <Bell size={17} color={C.black}/>
             </button>
           </div>
         </div>
 
-        {/* Search bar */}
+        {/* Search */}
         <div style={{
           display: 'flex', alignItems: 'center', gap: 10,
           background: C.bg, border: `1px solid ${C.border}`,
@@ -438,10 +446,8 @@ export default function Home() {
             background: BANNERS[bannerIdx].bg,
             borderRadius: 16, padding: '20px',
             position: 'relative', overflow: 'hidden',
-            transition: 'background 0.6s ease',
-            minHeight: 130,
+            transition: 'background 0.6s ease', minHeight: 130,
           }}>
-            {/* Decorative bubble */}
             <div style={{
               position: 'absolute', right: -20, top: -20,
               width: 130, height: 130, borderRadius: '50%',
@@ -466,11 +472,9 @@ export default function Home() {
             <button
               onClick={() => navigate(BANNERS[bannerIdx].path)}
               style={{
-                background: BANNERS[bannerIdx].accent,
-                border: 'none', borderRadius: 99,
-                padding: '8px 16px', cursor: 'pointer',
-                fontSize: '0.75rem', fontWeight: 700,
-                color: BANNERS[bannerIdx].bg,
+                background: BANNERS[bannerIdx].accent, border: 'none',
+                borderRadius: 99, padding: '8px 16px', cursor: 'pointer',
+                fontSize: '0.75rem', fontWeight: 700, color: BANNERS[bannerIdx].bg,
                 display: 'inline-flex', alignItems: 'center', gap: 6,
                 transition: 'background 0.5s ease, color 0.5s ease',
               }}
@@ -479,18 +483,13 @@ export default function Home() {
             </button>
           </div>
 
-          {/* Dot indicators */}
-          <div style={{
-            display: 'flex', justifyContent: 'center',
-            gap: 6, marginTop: 10,
-          }}>
+          <div style={{ display: 'flex', justifyContent: 'center', gap: 6, marginTop: 10 }}>
             {BANNERS.map((_, i) => (
               <button
                 key={i}
                 onClick={() => setBannerIdx(i)}
                 style={{
-                  width: i === bannerIdx ? 20 : 6,
-                  height: 6, borderRadius: 99,
+                  width: i === bannerIdx ? 20 : 6, height: 6, borderRadius: 99,
                   background: i === bannerIdx ? C.black : C.border,
                   border: 'none', cursor: 'pointer', padding: 0,
                   transition: 'all 0.3s ease',
@@ -506,17 +505,14 @@ export default function Home() {
             <div style={{ fontSize: '1rem', fontWeight: 700, color: C.black }}>Categories</div>
           </div>
           <div style={{ display: 'flex', gap: 10, overflowX: 'auto', paddingBottom: 4, scrollbarWidth: 'none' }}>
-            {/* All pill */}
             <button
               onClick={() => setSelectedCat(null)}
               style={{
                 flexShrink: 0, padding: '8px 16px', borderRadius: 99,
                 background: !selectedCat ? C.black : C.white,
                 border: `1px solid ${!selectedCat ? C.black : C.border}`,
-                cursor: 'pointer',
-                fontSize: '0.75rem', fontWeight: 600,
-                color: !selectedCat ? C.white : C.black,
-                transition: 'all .15s',
+                cursor: 'pointer', fontSize: '0.75rem', fontWeight: 600,
+                color: !selectedCat ? C.white : C.black, transition: 'all .15s',
               }}
             >
               All
@@ -528,15 +524,12 @@ export default function Home() {
                   key={tag}
                   onClick={() => setSelectedCat(active ? null : tag)}
                   style={{
-                    flexShrink: 0,
-                    display: 'flex', alignItems: 'center', gap: 6,
+                    flexShrink: 0, display: 'flex', alignItems: 'center', gap: 6,
                     padding: '8px 14px', borderRadius: 99,
                     background: active ? C.black : C.white,
                     border: `1px solid ${active ? C.black : C.border}`,
-                    cursor: 'pointer',
-                    fontSize: '0.75rem', fontWeight: 600,
-                    color: active ? C.white : C.black,
-                    transition: 'all .15s',
+                    cursor: 'pointer', fontSize: '0.75rem', fontWeight: 600,
+                    color: active ? C.white : C.black, transition: 'all .15s',
                   }}
                 >
                   <Icon size={13} color={active ? C.white : C.ochre}/>
@@ -547,17 +540,14 @@ export default function Home() {
           </div>
         </div>
 
-        {/* ── Loading state ── */}
+        {/* ── Loading ── */}
         {loading && (
           <div style={{ textAlign: 'center', padding: '60px 0' }}>
-            <Loader
-              size={24} color={C.ochre}
-              style={{ animation: 'spin 1s linear infinite', display: 'block', margin: '0 auto' }}
-            />
+            <Loader size={24} color={C.ochre} style={{ animation: 'spin 1s linear infinite', display: 'block', margin: '0 auto' }}/>
           </div>
         )}
 
-        {/* ── Empty state ── */}
+        {/* ── Empty ── */}
         {!loading && filtered.length === 0 && (
           <div style={{ textAlign: 'center', padding: '60px 20px' }}>
             <ShoppingBag size={40} color={C.border} style={{ margin: '0 auto 16px', display: 'block' }}/>
@@ -565,7 +555,7 @@ export default function Home() {
               {searchQuery ? 'No results found' : 'No products yet'}
             </div>
             <div style={{ fontSize: '0.8rem', color: C.muted, marginBottom: 20 }}>
-              {searchQuery ? `Try a different search` : 'Be the first seller on Bitsoko'}
+              {searchQuery ? 'Try a different search' : 'Be the first seller on Bitsoko'}
             </div>
             {!searchQuery && (
               <button
@@ -586,14 +576,9 @@ export default function Home() {
         {/* ── Recent listings ── */}
         {!loading && recent.length > 0 && (
           <div style={{ padding: '20px 16px 0' }}>
-            <div style={{
-              display: 'flex', justifyContent: 'space-between',
-              alignItems: 'center', marginBottom: 14,
-            }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14 }}>
               <div style={{ fontSize: '1rem', fontWeight: 700, color: C.black }}>
-                {selectedCat
-                  ? CATEGORIES.find(c => c.tag === selectedCat)?.label
-                  : 'Recent listings'}
+                {selectedCat ? CATEGORIES.find(c => c.tag === selectedCat)?.label : 'Recent listings'}
               </div>
               <button
                 onClick={() => navigate('/explore')}
@@ -622,10 +607,7 @@ export default function Home() {
         {/* ── Top sellers ── */}
         {!loading && topSellers.length > 0 && (
           <div style={{ padding: '24px 16px 0' }}>
-            <div style={{
-              display: 'flex', justifyContent: 'space-between',
-              alignItems: 'center', marginBottom: 14,
-            }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14 }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                 <TrendingUp size={16} color={C.ochre}/>
                 <span style={{ fontSize: '1rem', fontWeight: 700, color: C.black }}>Top sellers</span>
@@ -642,8 +624,7 @@ export default function Home() {
                     onClick={() => navigate(`/seller/${pubkey}`)}
                     style={{
                       background: C.white, borderRadius: 14,
-                      border: `1px solid ${C.border}`,
-                      padding: '12px 16px',
+                      border: `1px solid ${C.border}`, padding: '12px 16px',
                       display: 'flex', alignItems: 'center', gap: 12,
                       cursor: 'pointer',
                     }}
@@ -652,10 +633,7 @@ export default function Home() {
                     <div style={{ flex: 1, minWidth: 0 }}>
                       <div style={{ fontSize: '0.88rem', fontWeight: 700, color: C.black }}>{name}</div>
                       {ln && (
-                        <div style={{
-                          display: 'flex', alignItems: 'center', gap: 4,
-                          fontSize: '0.68rem', color: C.ochre, marginTop: 2,
-                        }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: '0.68rem', color: C.ochre, marginTop: 2 }}>
                           <Zap size={10} fill={C.ochre} color={C.ochre}/> {ln}
                         </div>
                       )}
@@ -675,8 +653,7 @@ export default function Home() {
         <div style={{
           margin: '24px 16px 0',
           background: C.white, borderRadius: 16,
-          border: `1px solid ${C.border}`,
-          padding: '20px',
+          border: `1px solid ${C.border}`, padding: '20px',
           display: 'flex', alignItems: 'center', gap: 16,
         }}>
           <div style={{
@@ -687,12 +664,8 @@ export default function Home() {
             <Store size={22} color={C.ochre}/>
           </div>
           <div style={{ flex: 1 }}>
-            <div style={{ fontSize: '0.88rem', fontWeight: 700, color: C.black, marginBottom: 2 }}>
-              Start selling today
-            </div>
-            <div style={{ fontSize: '0.72rem', color: C.muted }}>
-              List products, get paid in sats
-            </div>
+            <div style={{ fontSize: '0.88rem', fontWeight: 700, color: C.black, marginBottom: 2 }}>Start selling today</div>
+            <div style={{ fontSize: '0.72rem', color: C.muted }}>List products, get paid in sats</div>
           </div>
           <button
             onClick={() => navigate('/create-listing')}
@@ -700,8 +673,7 @@ export default function Home() {
               background: C.black, border: 'none', borderRadius: 10,
               padding: '10px 16px', cursor: 'pointer',
               fontSize: '0.75rem', fontWeight: 700, color: C.white,
-              display: 'flex', alignItems: 'center', gap: 6,
-              flexShrink: 0,
+              display: 'flex', alignItems: 'center', gap: 6, flexShrink: 0,
             }}
           >
             <Plus size={14}/> List

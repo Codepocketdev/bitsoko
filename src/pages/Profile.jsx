@@ -1,14 +1,16 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
+import { nip19 } from 'nostr-tools'
+import { finalizeEvent } from 'nostr-tools/pure'
+import { SimplePool } from 'nostr-tools/pool'
 import {
-  Camera, Check, Loader, AlertCircle,
-  Zap, ShieldCheck, User,
-  Eye, EyeOff, Copy, Key,
-  CheckCircle, ArrowLeft,
+  ArrowLeft, Check, Copy, Eye, EyeOff, Save,
+  Upload, Zap, Globe, AtSign, User, FileText,
+  Image, RefreshCw, X, Grid,
 } from 'lucide-react'
-import { getProfile, saveProfile } from '../lib/db'
-import { uploadImage, getPool, RELAYS } from '../lib/nostrSync'
-import { finalizeEvent, nip19 } from 'nostr-tools'
+import { getSecretKey, getPublicKeyHex, getWriteRelays, DEFAULT_RELAYS, uploadImage } from '../lib/nostrSync'
+import { saveProfile } from '../lib/db'
+import { useNostrProfile } from '../hooks/useNostrProfile'
 
 const C = {
   bg:     '#f7f4f0',
@@ -17,599 +19,332 @@ const C = {
   muted:  '#b0a496',
   border: '#e8e0d5',
   orange: '#f7931a',
-  ochre:  '#c8860a',
+  terra:  '#b5451b',
+  sage:   '#2d6a4f',
+  inputBg:'#faf8f5',
   red:    '#ef4444',
   green:  '#22c55e',
 }
 
-function getSecretKey() {
-  const nsec = localStorage.getItem('bitsoko_nsec')
-  if (!nsec) throw new Error('No secret key')
-  return nip19.decode(nsec).data
-}
+const FETCH_RELAYS = [
+  'wss://relay.damus.io',
+  'wss://nos.lol',
+  'wss://relay.primal.net',
+  'wss://relay.nostr.band',
+  'wss://nostr-pub.wellorder.net',
+]
 
-function getPublicKeyHex() {
-  try {
-    const npub = localStorage.getItem('bitsoko_npub')
-    return nip19.decode(npub).data
-  } catch { throw new Error('No public key') }
-}
-
-function Field({ label, hint, children }) {
-  return (
-    <div style={{ marginBottom: 20 }}>
-      <label style={{
-        display: 'block', fontSize: '0.78rem',
-        fontWeight: 600, color: C.black, marginBottom: hint ? 4 : 8,
-        fontFamily: "'Inter',sans-serif",
-      }}>
-        {label}
-      </label>
-      {hint && (
-        <div style={{ fontSize: '0.68rem', color: C.muted, marginBottom: 8, fontFamily: "'Inter',sans-serif" }}>
-          {hint}
-        </div>
-      )}
-      {children}
-    </div>
-  )
-}
+const FIELDS = [
+  { key: 'name',         label: 'Username',          icon: AtSign,   placeholder: 'satoshi',              type: 'text'     },
+  { key: 'display_name', label: 'Display Name',      icon: User,     placeholder: 'Satoshi Nakamoto',     type: 'text'     },
+  { key: 'about',        label: 'Bio',               icon: FileText, placeholder: 'Building on Bitcoin…', type: 'textarea' },
+  { key: 'picture',      label: 'Avatar URL',        icon: Image,    placeholder: 'https://…',            type: 'text'     },
+  { key: 'banner',       label: 'Banner URL',        icon: Image,    placeholder: 'https://…',            type: 'text'     },
+  { key: 'website',      label: 'Website',           icon: Globe,    placeholder: 'https://yoursite.com', type: 'text'     },
+  { key: 'lud16',        label: 'Lightning Address', icon: Zap,      placeholder: 'you@wallet.com',       type: 'text'     },
+]
 
 export default function Profile() {
-  const navigate  = useNavigate()
-  const fileRef   = useRef()
-  const pubkeyHex = getPublicKeyHex()
-  const npub      = localStorage.getItem('bitsoko_npub') || ''
-  const nsec      = localStorage.getItem('bitsoko_nsec') || ''
+  const navigate = useNavigate()
 
-  const [showNsec,    setShowNsec]    = useState(false)
-  const [nsecCopied,  setNsecCopied]  = useState(false)
-  const [npubCopied,  setNpubCopied]  = useState(false)
+  // Get pubkey — read once on mount, stable
+  const pubkeyHex = (() => { try { return getPublicKeyHex() } catch { return '' } })()
+  const npub      = pubkeyHex ? nip19.npubEncode(pubkeyHex) : ''
+  const nsec      = (() => { try { return nip19.nsecEncode(getSecretKey()) } catch { return '' } })()
+  const shortNpub = npub ? `${npub.slice(0,16)}…${npub.slice(-8)}` : ''
 
-  // ── Form state ────────────────────────────
-  const [name,        setName]        = useState('')
-  const [displayName, setDisplayName] = useState('')
-  const [bio,         setBio]         = useState('')
-  const [picture,     setPicture]     = useState('')
-  const [lud16,       setLud16]       = useState(localStorage.getItem('bitsoko_ln') || '')
-  const [nip05,       setNip05]       = useState('')
-  const [website,     setWebsite]     = useState('')
+  // ── useNostrProfile: IndexedDB first, relay second, saves back to IndexedDB
+  // This is the GradeBase pattern — zero flash on re-login
+  const { profile, loading } = useNostrProfile(pubkeyHex)
 
-  const [uploading,   setUploading]   = useState(false)
-  const [saving,      setSaving]      = useState(false)
-  const [saved,       setSaved]       = useState(false)
-  const [errMsg,      setErrMsg]      = useState('')
-  const [loading,     setLoading]     = useState(true)
-  const [avatarErr,   setAvatarErr]   = useState(false)
+  // Form state — hydrated from hook, only fills empty fields so edits aren't clobbered
+  const [form, setForm] = useState({})
 
-  // ── Load existing kind:0 ──────────────────
   useEffect(() => {
-    let mounted = true
-    const load = async () => {
-      // 1. Load from IndexedDB first (instant)
-      const cached = await getProfile(pubkeyHex)
-      if (cached && mounted) {
-        setName(cached.name              || '')
-        setDisplayName(cached.display_name || '')
-        setBio(cached.about              || '')
-        setPicture(cached.picture        || '')
-        setLud16(cached.lud16            || localStorage.getItem('bitsoko_ln') || '')
-        setNip05(cached.nip05            || '')
-        setWebsite(cached.website        || '')
-        setLoading(false)
-      }
-
-      // 2. Fetch fresh from relay
-      const pool = getPool()
-      const sub  = pool.subscribe(
-        RELAYS,
-        [{ kinds: [0], authors: [pubkeyHex], limit: 1 }],
-        {
-          onevent(e) {
-            try {
-              const p = JSON.parse(e.content)
-              if (!mounted) return
-              setName(p.name              || '')
-              setDisplayName(p.display_name || '')
-              setBio(p.about              || '')
-              setPicture(p.picture        || '')
-              setLud16(p.lud16            || localStorage.getItem('bitsoko_ln') || '')
-              setNip05(p.nip05            || '')
-              setWebsite(p.website        || '')
-              setLoading(false)
-              // Cache it
-              saveProfile(pubkeyHex, p)
-            } catch {}
-          },
-          oneose() {
-            if (mounted) setLoading(false)
-            sub.close()
-          },
-        }
-      )
-      setTimeout(() => { try { sub.close() } catch {} }, 6000)
-    }
-    load()
-    return () => { mounted = false }
-  }, [pubkeyHex])
-
-  // ── Upload avatar ─────────────────────────
-  const handleAvatar = async (file) => {
-    if (!file || !file.type.startsWith('image/')) return
-    if (file.size > 10 * 1024 * 1024) { setErrMsg('Max 10MB'); return }
-    setUploading(true); setErrMsg(''); setAvatarErr(false)
-    try {
-      const url = await uploadImage(file)
-      setPicture(url)
-    } catch (e) {
-      setErrMsg(e.message || 'Upload failed')
-    }
-    setUploading(false)
-  }
-
-  // ── Publish kind:0 ────────────────────────
-  const handleSave = async () => {
-    if (saving || saved) return
-    if (!name.trim() && !displayName.trim()) {
-      setErrMsg('Add at least a name or display name')
-      return
-    }
-    setSaving(true); setErrMsg('')
-
-    try {
-      const sk      = getSecretKey()
-      const content = JSON.stringify({
-        name:         name.trim(),
-        display_name: displayName.trim(),
-        about:        bio.trim(),
-        picture:      picture.trim(),
-        lud16:        lud16.trim(),
-        nip05:        nip05.trim(),
-        website:      website.trim(),
-        // Bitsoko tag so other clients know this seller is on Bitsoko
-        bitsoko:      'true',
+    if (!profile) return
+    setForm(prev => {
+      const merged = { ...prev }
+      FIELDS.forEach(({ key }) => {
+        if (profile[key] && !prev[key]) merged[key] = profile[key]
       })
-
-      const event = finalizeEvent({
-        kind:       0,
-        created_at: Math.floor(Date.now() / 1000),
-        tags:       [],
-        content,
-      }, sk)
-
-      // Save to IndexedDB
-      await saveProfile(pubkeyHex, JSON.parse(content))
-
-      // Broadcast to all relays
-      const pool = getPool()
-      await Promise.any(pool.publish(RELAYS, event))
-
-      // Update localStorage display name for header greeting
-      localStorage.setItem('bitsoko_display_name', displayName.trim() || name.trim())
-
-      setSaving(false); setSaved(true)
-      setTimeout(() => setSaved(false), 3000)
-    } catch (e) {
-      setErrMsg(e.message || 'Failed to save — check connection')
-      setSaving(false)
+      return merged
+    })
+    // Cache display name and ln for home screen
+    if (profile.display_name || profile.name) {
+      localStorage.setItem('bitsoko_display_name', profile.display_name || profile.name)
     }
+    if (profile.lud16) localStorage.setItem('bitsoko_ln', profile.lud16)
+  }, [profile])
+
+  const [saving,    setSaving]    = useState(false)
+  const [saved,     setSaved]     = useState(false)
+  const [error,     setError]     = useState('')
+  const [showNsec,  setShowNsec]  = useState(false)
+  const [copied,    setCopied]    = useState('')
+  const [uploading, setUploading] = useState(null)
+  const [showQR,    setShowQR]    = useState(false)
+  const [refreshing,setRefreshing]= useState(false)
+
+  const set = (key, val) => setForm(prev => ({ ...prev, [key]: val }))
+
+  const fetchStatus = loading ? 'loading' : profile ? 'found' : 'empty'
+
+  const handleRefresh = async () => {
+    if (!pubkeyHex) return
+    setRefreshing(true); setError('')
+    try {
+      const pool   = new SimplePool()
+      const events = await pool.querySync(FETCH_RELAYS, { kinds: [0], authors: [pubkeyHex], limit: 1 })
+      if (!events.length) throw new Error('No profile found on relays')
+      const p = JSON.parse(events[0].content)
+      await saveProfile(pubkeyHex, p)
+      setForm({})
+      FIELDS.forEach(({ key }) => { if (p[key]) setForm(prev => ({ ...prev, [key]: p[key] })) })
+    } catch (e) { setError(e.message || 'Refresh failed') }
+    setRefreshing(false)
   }
 
-  const copyNpub = () => {
-    navigator.clipboard?.writeText(npub)
-    setNpubCopied(true)
-    setTimeout(() => setNpubCopied(false), 2000)
+  const handleSave = async () => {
+    setSaving(true); setError(''); setSaved(false)
+    try {
+      const payload = { ...(profile || {}), ...form }
+      Object.keys(payload).forEach(k => { if (!payload[k]) delete payload[k] })
+      const sk     = getSecretKey()
+      const relays = [...new Set([...getWriteRelays(), ...DEFAULT_RELAYS])]
+      const event  = finalizeEvent({
+        kind: 0, created_at: Math.floor(Date.now() / 1000),
+        tags: [], content: JSON.stringify(payload),
+      }, sk)
+      await Promise.any(new SimplePool().publish(relays, event))
+      await saveProfile(pubkeyHex, payload)
+      setSaved(true)
+      setTimeout(() => setSaved(false), 3000)
+    } catch (e) { setError(e.message || 'Publish failed') }
+    setSaving(false)
   }
 
-  const copyNsec = () => {
-    navigator.clipboard?.writeText(nsec)
-    setNsecCopied(true)
-    setTimeout(() => setNsecCopied(false), 2000)
+  const handleUpload = async (fieldKey, file) => {
+    if (!file) return
+    setUploading(fieldKey)
+    try { set(fieldKey, await uploadImage(file)) }
+    catch (e) { setError(`Upload failed: ${e.message}`) }
+    setUploading(null)
   }
 
-  const nameToShow = displayName || name
+  const copy = async (text, label) => {
+    try { await navigator.clipboard.writeText(text); setCopied(label); setTimeout(() => setCopied(''), 2000) } catch {}
+  }
+
+  const avatar   = form.picture || profile?.picture
+  const dispName = form.display_name || form.name || profile?.display_name || profile?.name || shortNpub
 
   return (
-    <div style={{ background: C.bg, minHeight: '100vh', fontFamily: "'Inter',sans-serif" }}>
+    <div style={{ minHeight: '100vh', background: C.bg, paddingBottom: 100 }}>
 
-      {/* ── Header ── */}
+      {/* Top bar */}
       <div style={{
-        background: C.white, borderBottom: `1px solid ${C.border}`,
-        padding: '16px 20px',
-        display: 'flex', alignItems: 'center', gap: 14,
         position: 'sticky', top: 0, zIndex: 50,
+        background: C.white, borderBottom: `1px solid ${C.border}`,
+        display: 'flex', alignItems: 'center', gap: 12, padding: '14px 16px',
       }}>
-        <button onClick={() => navigate(-1)} style={{
-          width: 36, height: 36, borderRadius: '50%',
-          background: C.bg, border: `1px solid ${C.border}`,
+        <button onClick={() => navigate('/', { state: { openMore: true } })} style={{
+          width: 36, height: 36, borderRadius: '50%', border: `1px solid ${C.border}`,
+          background: C.bg, cursor: 'pointer',
           display: 'flex', alignItems: 'center', justifyContent: 'center',
-          cursor: 'pointer', flexShrink: 0,
         }}>
-          <ArrowLeft size={17} color={C.black}/>
+          <ArrowLeft size={18} color={C.black} />
         </button>
-        <div style={{ flex: 1 }}>
-          <div style={{ fontSize: '1rem', fontWeight: 700, color: C.black }}>Your profile</div>
-          <div style={{ fontSize: '0.68rem', color: C.muted }}>Visible to buyers on Bitsoko + all Nostr clients</div>
+        <span style={{ fontSize: 17, fontWeight: 800, color: C.black, flex: 1 }}>My Profile</span>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
+          <div style={{
+            width: 7, height: 7, borderRadius: '50%',
+            background: fetchStatus === 'found' ? C.sage : fetchStatus === 'loading' ? C.orange : C.muted,
+            animation: fetchStatus === 'loading' ? 'pulse 1.2s ease-in-out infinite' : 'none',
+          }} />
+          <span style={{ fontSize: 11, color: C.muted }}>
+            {fetchStatus === 'found' ? 'Loaded' : fetchStatus === 'loading' ? 'Fetching…' : 'New'}
+          </span>
         </div>
-        {/* Save button in header */}
-        <button
-          onClick={handleSave}
-          disabled={saving || saved}
-          style={{
-            padding: '8px 18px', borderRadius: 99,
-            background: saved ? C.green : C.black,
-            border: 'none', cursor: saving || saved ? 'not-allowed' : 'pointer',
-            fontSize: '0.78rem', fontWeight: 700, color: C.white,
-            display: 'flex', alignItems: 'center', gap: 6,
-            transition: 'all .2s',
-          }}
-        >
-          {saving
-            ? <><Loader size={13} style={{ animation: 'spin 1s linear infinite' }}/> Saving…</>
-            : saved
-            ? <><CheckCircle size={13}/> Saved!</>
-            : 'Save'
-          }
-        </button>
       </div>
 
-      <div style={{ padding: '28px 20px 40px' }}>
-
-        {/* ── Avatar section ── */}
-        <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', marginBottom: 32 }}>
-          <div style={{ position: 'relative', marginBottom: 12 }}>
-            {/* Avatar */}
+      {/* Avatar row */}
+      <div style={{ background: C.white, padding: '20px 16px', marginBottom: 10, borderBottom: `1px solid ${C.border}` }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
+          <label style={{ cursor: 'pointer', position: 'relative', flexShrink: 0 }}>
             <div style={{
-              width: 96, height: 96, borderRadius: '50%',
-              background: C.black, overflow: 'hidden',
-              border: `3px solid ${C.white}`,
-              boxShadow: '0 4px 16px rgba(26,20,16,0.12)',
+              width: 76, height: 76, borderRadius: '50%',
+              background: `linear-gradient(135deg, ${C.orange}, ${C.terra})`,
+              border: `3px solid ${C.bg}`, boxShadow: '0 2px 12px rgba(0,0,0,0.1)',
               display: 'flex', alignItems: 'center', justifyContent: 'center',
+              fontSize: 24, fontWeight: 900, color: '#fff', overflow: 'hidden',
             }}>
-              {picture && !avatarErr
-                ? <img src={picture} alt={nameToShow} onError={() => setAvatarErr(true)}
-                    style={{ width: '100%', height: '100%', objectFit: 'cover' }}/>
-                : <span style={{ fontSize: '2rem', fontWeight: 700, color: C.white }}>
-                    {nameToShow?.[0]?.toUpperCase() || '?'}
-                  </span>
+              {avatar
+                ? <img src={avatar} alt="" style={{ width: '100%', height: '100%', objectFit: 'cover' }} onError={e => e.target.style.display = 'none'} />
+                : dispName.slice(0, 2).toUpperCase()
               }
             </div>
-
-            {/* Camera button */}
-            <button
-              onClick={() => fileRef.current?.click()}
-              disabled={uploading}
-              style={{
-                position: 'absolute', bottom: 0, right: 0,
-                width: 30, height: 30, borderRadius: '50%',
-                background: C.black, border: `2px solid ${C.white}`,
-                display: 'flex', alignItems: 'center', justifyContent: 'center',
-                cursor: uploading ? 'not-allowed' : 'pointer',
-              }}
+            <div style={{
+              position: 'absolute', inset: 0, borderRadius: '50%',
+              background: 'rgba(0,0,0,0.4)',
+              display: 'flex', alignItems: 'center', justifyContent: 'center',
+              opacity: 0, transition: 'opacity .2s',
+            }}
+              onMouseEnter={e => e.currentTarget.style.opacity = 1}
+              onMouseLeave={e => e.currentTarget.style.opacity = 0}
             >
-              {uploading
-                ? <Loader size={13} color={C.white} style={{ animation: 'spin 1s linear infinite' }}/>
-                : <Camera size={13} color={C.white}/>
+              {uploading === 'picture'
+                ? <div style={{ width: 14, height: 14, borderRadius: '50%', border: '2px solid #fff', borderTopColor: 'transparent', animation: 'spin .7s linear infinite' }} />
+                : <Upload size={14} color="#fff" />
               }
-            </button>
-          </div>
-
-          <div style={{ fontSize: '0.88rem', fontWeight: 700, color: C.black }}>
-            {nameToShow || 'Your name'}
-          </div>
-          <div style={{ fontSize: '0.68rem', color: C.muted, marginTop: 3, fontFamily: 'monospace' }}>
-            {npub.slice(0, 20)}…
-          </div>
-
-          <input ref={fileRef} type="file" accept="image/*"
-            onChange={e => handleAvatar(e.target.files?.[0])}
-            style={{ display: 'none' }}/>
-        </div>
-
-        {/* ── Fields ── */}
-
-        {/* Identity section */}
-        <div style={{
-          background: C.white, borderRadius: 16,
-          border: `1px solid ${C.border}`, padding: '18px',
-          marginBottom: 16,
-        }}>
-          <div style={{
-            display: 'flex', alignItems: 'center', gap: 8,
-            marginBottom: 18,
-          }}>
-            <User size={15} color={C.ochre}/>
-            <span style={{ fontSize: '0.82rem', fontWeight: 700, color: C.black }}>Identity</span>
-          </div>
-
-          <Field label="Display name *" hint="This is what buyers see on your listings">
-            <input
-              value={displayName}
-              onChange={e => setDisplayName(e.target.value)}
-              placeholder="e.g. Hodl Leather Works"
-              maxLength={50}
-              style={{
-                width: '100%', padding: '12px 14px',
-                background: C.bg, border: `1.5px solid ${displayName ? C.black : C.border}`,
-                borderRadius: 12, outline: 'none',
-                fontSize: '0.9rem', color: C.black,
-                fontFamily: "'Inter',sans-serif",
-                boxSizing: 'border-box', transition: 'border-color .2s',
-              }}
-            />
-          </Field>
-
-          <Field label="Username" hint="Your @handle on Nostr (no spaces)">
-            <div style={{ position: 'relative' }}>
-              <span style={{
-                position: 'absolute', left: 14, top: '50%',
-                transform: 'translateY(-50%)',
-                fontSize: '0.9rem', color: C.muted,
-                fontFamily: "'Inter',sans-serif",
-              }}>@</span>
-              <input
-                value={name}
-                onChange={e => setName(e.target.value.replace(/\s/g, '').toLowerCase())}
-                placeholder="hodlleather"
-                maxLength={30}
-                style={{
-                  width: '100%', padding: '12px 14px 12px 28px',
-                  background: C.bg, border: `1.5px solid ${name ? C.black : C.border}`,
-                  borderRadius: 12, outline: 'none',
-                  fontSize: '0.9rem', color: C.black,
-                  fontFamily: "'Inter',sans-serif",
-                  boxSizing: 'border-box', transition: 'border-color .2s',
-                }}
-              />
             </div>
-          </Field>
+            <input type="file" accept="image/*" style={{ display: 'none' }}
+              onChange={e => handleUpload('picture', e.target.files?.[0])} />
+          </label>
 
-          <Field label="Bio" hint="Tell buyers about you or your craft">
-            <textarea
-              value={bio}
-              onChange={e => setBio(e.target.value)}
-              placeholder="Handcrafting premium leather goods in Nairobi since 2021…"
-              maxLength={300}
-              rows={3}
-              style={{
-                width: '100%', padding: '12px 14px',
-                background: C.bg, border: `1.5px solid ${bio ? C.black : C.border}`,
-                borderRadius: 12, outline: 'none', resize: 'none',
-                fontSize: '0.85rem', color: C.black, lineHeight: 1.6,
-                fontFamily: "'Inter',sans-serif",
-                boxSizing: 'border-box', transition: 'border-color .2s',
-              }}
-            />
-            <div style={{ textAlign: 'right', fontSize: '0.65rem', color: C.muted, marginTop: 4 }}>
-              {bio.length}/300
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div style={{ fontSize: 18, fontWeight: 800, color: C.black }}>
+              {loading && !profile ? '…' : dispName}
             </div>
-          </Field>
-        </div>
-
-        {/* Payment section */}
-        <div style={{
-          background: C.white, borderRadius: 16,
-          border: `1px solid ${C.border}`, padding: '18px',
-          marginBottom: 16,
-        }}>
-          <div style={{
-            display: 'flex', alignItems: 'center', gap: 8,
-            marginBottom: 18,
-          }}>
-            <Zap size={15} color={C.orange} fill={C.orange}/>
-            <span style={{ fontSize: '0.82rem', fontWeight: 700, color: C.black }}>Lightning payments</span>
-          </div>
-
-          <Field label="Lightning address" hint="Buyers pay you directly here — e.g. you@blink.sv">
-            <input
-              value={lud16}
-              onChange={e => setLud16(e.target.value.trim())}
-              placeholder="you@blink.sv"
-              type="email"
-              style={{
-                width: '100%', padding: '12px 14px',
-                background: C.bg, border: `1.5px solid ${lud16 ? C.orange : C.border}`,
-                borderRadius: 12, outline: 'none',
-                fontSize: '0.9rem', color: C.black,
-                fontFamily: "'Inter',sans-serif",
-                boxSizing: 'border-box', transition: 'border-color .2s',
-              }}
-            />
-            {lud16 && (
-              <div style={{
-                display: 'flex', alignItems: 'center', gap: 6,
-                marginTop: 6, fontSize: '0.68rem', color: C.green,
-                fontFamily: "'Inter',sans-serif",
-              }}>
-                <Zap size={10} fill={C.green} color={C.green}/> Buyers can pay you directly in sats
+            {(form.lud16 || profile?.lud16) && (
+              <div style={{ fontSize: 12, color: C.sage, display: 'flex', alignItems: 'center', gap: 4, marginTop: 2 }}>
+                <Zap size={11} /> {form.lud16 || profile?.lud16}
               </div>
             )}
-          </Field>
-        </div>
-
-        {/* Verification section */}
-        <div style={{
-          background: C.white, borderRadius: 16,
-          border: `1px solid ${C.border}`, padding: '18px',
-          marginBottom: 16,
-        }}>
-          <div style={{
-            display: 'flex', alignItems: 'center', gap: 8,
-            marginBottom: 18,
-          }}>
-            <ShieldCheck size={15} color={C.green}/>
-            <span style={{ fontSize: '0.82rem', fontWeight: 700, color: C.black }}>Verification</span>
+            <div style={{ fontSize: 11, color: C.muted, fontFamily: 'monospace', marginTop: 4, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{shortNpub}</div>
           </div>
 
-          <Field label="NIP-05 identifier" hint="Verified Nostr identity — e.g. you@yourdomain.com">
-            <input
-              value={nip05}
-              onChange={e => setNip05(e.target.value.trim())}
-              placeholder="you@yourdomain.com"
-              style={{
-                width: '100%', padding: '12px 14px',
-                background: C.bg, border: `1.5px solid ${nip05 ? C.black : C.border}`,
-                borderRadius: 12, outline: 'none',
-                fontSize: '0.9rem', color: C.black,
-                fontFamily: "'Inter',sans-serif",
-                boxSizing: 'border-box', transition: 'border-color .2s',
-              }}
-            />
-          </Field>
-
-          <Field label="Website">
-            <input
-              value={website}
-              onChange={e => setWebsite(e.target.value.trim())}
-              placeholder="https://yoursite.com"
-              type="url"
-              style={{
-                width: '100%', padding: '12px 14px',
-                background: C.bg, border: `1.5px solid ${website ? C.black : C.border}`,
-                borderRadius: 12, outline: 'none',
-                fontSize: '0.9rem', color: C.black,
-                fontFamily: "'Inter',sans-serif",
-                boxSizing: 'border-box', transition: 'border-color .2s',
-              }}
-            />
-          </Field>
-        </div>
-
-        {/* ── Keys section ── */}
-        <div style={{
-          background: C.white, borderRadius: 16,
-          border: `1px solid ${C.border}`, padding: '18px',
-          marginBottom: 16,
-        }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 18 }}>
-            <Key size={15} color={C.muted}/>
-            <span style={{ fontSize: '0.82rem', fontWeight: 700, color: C.black }}>Your Nostr keys</span>
+          <div style={{ display: 'flex', gap: 8 }}>
+            <button onClick={() => setShowQR(true)} style={{ width: 36, height: 36, borderRadius: 10, border: `1px solid ${C.border}`, background: C.bg, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+              <Grid size={15} color={C.muted} />
+            </button>
+            <button onClick={handleRefresh} disabled={refreshing} style={{ width: 36, height: 36, borderRadius: 10, border: `1px solid ${C.border}`, background: C.bg, cursor: refreshing ? 'default' : 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+              <RefreshCw size={15} color={refreshing ? C.orange : C.muted} style={{ animation: refreshing ? 'spin 1s linear infinite' : 'none' }} />
+            </button>
           </div>
+        </div>
+      </div>
 
-          {/* npub */}
-          <div style={{ marginBottom: 16 }}>
-            <div style={{ fontSize: '0.72rem', fontWeight: 600, color: C.black, marginBottom: 6 }}>
-              Public key (npub)
-            </div>
-            <div style={{ fontSize: '0.62rem', color: C.muted, marginBottom: 8 }}>
-              Share this freely — it's your Nostr identity
-            </div>
-            <div style={{ display: 'flex', gap: 8, alignItems: 'stretch' }}>
-              <div style={{
-                flex: 1, background: C.bg, borderRadius: 10,
-                padding: '10px 12px', fontSize: '0.68rem',
-                color: C.black, fontFamily: 'monospace',
-                wordBreak: 'break-all', lineHeight: 1.6,
-                border: `1px solid ${C.border}`,
-              }}>
-                {npub}
-              </div>
-              <button onClick={copyNpub} style={{
-                flexShrink: 0, width: 38, borderRadius: 10,
-                background: npubCopied ? 'rgba(34,197,94,0.08)' : C.bg,
-                border: `1px solid ${npubCopied ? C.green : C.border}`,
-                cursor: 'pointer',
-                display: 'flex', alignItems: 'center', justifyContent: 'center',
-              }}>
-                {npubCopied
-                  ? <Check size={15} color={C.green}/>
-                  : <Copy size={15} color={C.muted}/>
-                }
+      <div style={{ padding: '0 16px' }}>
+
+        {/* Keys */}
+        <div style={{ background: C.white, border: `1px solid ${C.border}`, borderRadius: 14, padding: 16, marginBottom: 14 }}>
+          <div style={{ fontSize: 11, fontWeight: 700, color: C.muted, textTransform: 'uppercase', letterSpacing: 1, marginBottom: 14 }}>Identity Keys</div>
+
+          <div style={{ marginBottom: 12 }}>
+            <div style={{ fontSize: 11, color: C.muted, marginBottom: 6 }}>Public Key (npub) — safe to share</div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, background: C.inputBg, border: `1px solid ${C.border}`, borderRadius: 10, padding: '10px 12px' }}>
+              <span style={{ flex: 1, fontSize: 11, fontFamily: 'monospace', color: C.black, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{shortNpub || 'Not available'}</span>
+              <button onClick={() => copy(npub, 'npub')} style={{ background: 'none', border: 'none', cursor: 'pointer', color: copied === 'npub' ? C.sage : C.muted, display: 'flex', padding: 2 }}>
+                {copied === 'npub' ? <Check size={14} /> : <Copy size={14} />}
               </button>
             </div>
           </div>
 
-          {/* Divider */}
-          <div style={{ height: 1, background: C.border, margin: '4px 0 16px' }}/>
-
-          {/* nsec warning banner */}
-          <div style={{
-            background: 'rgba(239,68,68,0.06)',
-            border: `1px solid rgba(239,68,68,0.15)`,
-            borderRadius: 12, padding: '12px 14px', marginBottom: 12,
-            display: 'flex', gap: 10, alignItems: 'flex-start',
-          }}>
-            <AlertCircle size={15} color={C.red} style={{ flexShrink: 0, marginTop: 1 }}/>
-            <div style={{ fontSize: '0.7rem', color: '#7a1f1f', lineHeight: 1.6, fontFamily: "'Inter',sans-serif" }}>
-              <strong>Never share your secret key.</strong> Anyone with your nsec has full control of your account and all your listings. Store it somewhere safe offline.
-            </div>
-          </div>
-
-          {/* nsec */}
           <div>
-            <div style={{ fontSize: '0.72rem', fontWeight: 600, color: C.black, marginBottom: 6 }}>
-              Secret key (nsec)
-            </div>
-            <div style={{ display: 'flex', gap: 8, alignItems: 'stretch' }}>
-              <div style={{
-                flex: 1, background: showNsec ? '#fff8f8' : C.bg,
-                borderRadius: 10, padding: '10px 12px',
-                fontSize: '0.68rem', fontFamily: 'monospace',
-                wordBreak: 'break-all', lineHeight: 1.6,
-                border: `1px solid ${showNsec ? 'rgba(239,68,68,0.3)' : C.border}`,
-                color: showNsec ? C.black : 'transparent',
-                textShadow: showNsec ? 'none' : '0 0 8px rgba(26,20,16,0.5)',
-                userSelect: showNsec ? 'text' : 'none',
-                transition: 'all .2s',
-                filter: showNsec ? 'none' : 'blur(4px)',
-              }}>
-                {nsec}
-              </div>
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-                {/* Reveal toggle */}
-                <button onClick={() => setShowNsec(s => !s)} style={{
-                  flexShrink: 0, width: 38, flex: 1, borderRadius: 10,
-                  background: showNsec ? 'rgba(239,68,68,0.06)' : C.bg,
-                  border: `1px solid ${showNsec ? 'rgba(239,68,68,0.2)' : C.border}`,
-                  cursor: 'pointer',
-                  display: 'flex', alignItems: 'center', justifyContent: 'center',
-                }}>
-                  {showNsec
-                    ? <EyeOff size={15} color={C.red}/>
-                    : <Eye size={15} color={C.muted}/>
-                  }
+            <div style={{ fontSize: 11, color: C.red, marginBottom: 6, fontWeight: 600 }}>Secret Key — NEVER share ⚠️</div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, background: 'rgba(239,68,68,0.04)', border: '1px solid rgba(239,68,68,0.15)', borderRadius: 10, padding: '10px 12px' }}>
+              <span style={{ flex: 1, fontSize: 11, fontFamily: 'monospace', color: C.red, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                {showNsec ? (nsec || 'Not found') : '•'.repeat(40)}
+              </span>
+              <button onClick={() => setShowNsec(s => !s)} style={{ background: 'none', border: 'none', cursor: 'pointer', color: C.muted, display: 'flex', padding: 2 }}>
+                {showNsec ? <EyeOff size={14} /> : <Eye size={14} />}
+              </button>
+              {showNsec && (
+                <button onClick={() => copy(nsec, 'nsec')} style={{ background: 'none', border: 'none', cursor: 'pointer', color: copied === 'nsec' ? C.sage : C.muted, display: 'flex', padding: 2 }}>
+                  {copied === 'nsec' ? <Check size={14} /> : <Copy size={14} />}
                 </button>
-                {/* Copy — only when revealed */}
-                {showNsec && (
-                  <button onClick={copyNsec} style={{
-                    flexShrink: 0, width: 38, flex: 1, borderRadius: 10,
-                    background: nsecCopied ? 'rgba(34,197,94,0.08)' : C.bg,
-                    border: `1px solid ${nsecCopied ? C.green : C.border}`,
-                    cursor: 'pointer',
-                    display: 'flex', alignItems: 'center', justifyContent: 'center',
-                  }}>
-                    {nsecCopied
-                      ? <Check size={15} color={C.green}/>
-                      : <Copy size={15} color={C.muted}/>
-                    }
-                  </button>
-                )}
-              </div>
+              )}
             </div>
-            {showNsec && (
-              <div style={{ fontSize: '0.65rem', color: C.red, marginTop: 8, fontFamily: "'Inter',sans-serif" }}>
-                Hide this screen before sharing or screenshotting
-              </div>
-            )}
           </div>
         </div>
 
-        {/* Error */}
-        {errMsg && (
-          <div style={{
-            display: 'flex', alignItems: 'center', gap: 8,
-            padding: '12px 14px', borderRadius: 12,
-            background: 'rgba(239,68,68,0.06)',
-            border: `1px solid rgba(239,68,68,0.2)`,
-            fontSize: '0.78rem', color: C.red,
-            fontFamily: "'Inter',sans-serif",
-          }}>
-            <AlertCircle size={15}/> {errMsg}
-          </div>
+        {/* Profile fields */}
+        <div style={{ background: C.white, border: `1px solid ${C.border}`, borderRadius: 14, padding: 16, marginBottom: 14 }}>
+          <div style={{ fontSize: 11, fontWeight: 700, color: C.muted, textTransform: 'uppercase', letterSpacing: 1, marginBottom: 16 }}>Profile Info</div>
+
+          {FIELDS.map(({ key, label, icon: Icon, placeholder, type }) => (
+            <div key={key} style={{ marginBottom: 16 }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 6 }}>
+                <Icon size={12} color={C.muted} />
+                <span style={{ fontSize: 12, color: C.black, fontWeight: 600 }}>{label}</span>
+                {profile?.[key] && form[key] === profile[key] && (
+                  <span style={{ marginLeft: 'auto', fontSize: 10, color: C.sage, background: 'rgba(45,106,79,0.08)', padding: '2px 7px', borderRadius: 4, border: '1px solid rgba(45,106,79,0.2)' }}>
+                    from Nostr ✓
+                  </span>
+                )}
+              </div>
+              {type === 'textarea' ? (
+                <textarea value={form[key] || ''} onChange={e => set(key, e.target.value)} placeholder={placeholder} rows={3}
+                  style={{ width: '100%', boxSizing: 'border-box', background: C.inputBg, border: `1px solid ${form[key] ? C.orange + '66' : C.border}`, borderRadius: 10, padding: '10px 12px', color: C.black, fontSize: 13, resize: 'vertical', fontFamily: 'inherit', outline: 'none' }} />
+              ) : (
+                <div style={{ display: 'flex', gap: 8 }}>
+                  <input type="text" value={form[key] || ''} onChange={e => set(key, e.target.value)} placeholder={placeholder}
+                    style={{ flex: 1, background: C.inputBg, border: `1px solid ${form[key] ? C.orange + '66' : C.border}`, borderRadius: 10, padding: '10px 12px', color: C.black, fontSize: 13, outline: 'none' }} />
+                  {(key === 'picture' || key === 'banner') && (
+                    <label style={{ width: 42, height: 42, borderRadius: 10, cursor: 'pointer', flexShrink: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'rgba(247,147,26,0.08)', border: `1px solid ${C.border}`, color: uploading === key ? C.orange : C.muted }}>
+                      {uploading === key
+                        ? <div style={{ width: 14, height: 14, borderRadius: '50%', border: `2px solid ${C.orange}`, borderTopColor: 'transparent', animation: 'spin .7s linear infinite' }} />
+                        : <Upload size={14} />
+                      }
+                      <input type="file" accept="image/*" style={{ display: 'none' }} onChange={e => handleUpload(key, e.target.files?.[0])} />
+                    </label>
+                  )}
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+
+        {error && (
+          <div style={{ background: 'rgba(239,68,68,0.08)', border: '1px solid rgba(239,68,68,0.25)', borderRadius: 10, padding: '10px 14px', marginBottom: 14, fontSize: 13, color: C.red }}>{error}</div>
         )}
+
+        <button onClick={handleSave} disabled={saving} style={{
+          width: '100%', padding: 16, borderRadius: 14, border: 'none',
+          background: saved ? C.muted : C.black,
+          color: '#fff', fontWeight: 800, fontSize: 16, cursor: saving ? 'default' : 'pointer',
+          display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 10,
+          opacity: saving ? 0.7 : 1, transition: 'all 0.3s',
+        }}>
+          {saving
+            ? <><div style={{ width: 16, height: 16, borderRadius: '50%', border: '2px solid rgba(255,255,255,0.4)', borderTopColor: '#fff', animation: 'spin .7s linear infinite' }} /> Publishing…</>
+            : saved
+            ? <><Check size={18} /> Saved to Nostr</>
+            : <><Save size={18} /> Save Profile</>
+          }
+        </button>
+        <div style={{ marginTop: 10, fontSize: 11, color: C.muted, textAlign: 'center' }}>
+          Publishes kind:0 · visible on Damus, Amethyst, Primal and all Nostr clients
+        </div>
       </div>
 
-      <style>{`@keyframes spin { to { transform: rotate(360deg) } }`}</style>
+      {/* QR Modal */}
+      {showQR && npub && (
+        <div onClick={e => e.target === e.currentTarget && setShowQR(false)}
+          style={{ position: 'fixed', inset: 0, zIndex: 400, background: 'rgba(0,0,0,0.6)', backdropFilter: 'blur(6px)', display: 'flex', alignItems: 'flex-end', justifyContent: 'center' }}>
+          <div style={{ width: '100%', maxWidth: 480, background: C.white, borderRadius: '20px 20px 0 0', border: `1px solid ${C.border}`, padding: '24px 20px 48px', position: 'relative', textAlign: 'center' }}>
+            <button onClick={() => setShowQR(false)} style={{ position: 'absolute', top: 14, right: 14, width: 30, height: 30, borderRadius: '50%', border: `1px solid ${C.border}`, background: C.bg, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+              <X size={14} color={C.muted} />
+            </button>
+            <div style={{ fontSize: 16, fontWeight: 800, color: C.black, marginBottom: 4 }}>{dispName}</div>
+            <div style={{ fontSize: 12, color: C.muted, marginBottom: 20 }}>Scan to find on Nostr</div>
+            <img src={`https://api.qrserver.com/v1/create-qr-code/?size=220x220&data=${encodeURIComponent(npub)}&bgcolor=f7f4f0&color=1a1410&margin=12`}
+              alt="QR" style={{ width: 220, height: 220, borderRadius: 14, display: 'block', margin: '0 auto', border: `1px solid ${C.border}` }} />
+            <div style={{ marginTop: 14, fontSize: 11, color: C.muted, fontFamily: 'monospace', wordBreak: 'break-all', padding: '0 16px' }}>{npub}</div>
+            <button onClick={() => copy(npub, 'qr')} style={{ marginTop: 14, display: 'inline-flex', alignItems: 'center', gap: 6, background: C.bg, border: `1px solid ${C.border}`, color: copied === 'qr' ? C.sage : C.black, padding: '10px 22px', borderRadius: 10, fontSize: 13, fontWeight: 700, cursor: 'pointer' }}>
+              {copied === 'qr' ? <Check size={13} /> : <Copy size={13} />}
+              {copied === 'qr' ? 'Copied!' : 'Copy npub'}
+            </button>
+          </div>
+        </div>
+      )}
+
+      <style>{`
+        @keyframes spin  { to { transform: rotate(360deg) } }
+        @keyframes pulse { 0%,100%{ opacity:1 } 50%{ opacity:0.35 } }
+        input::placeholder, textarea::placeholder { color: #c0b8b0; }
+        input:focus, textarea:focus { border-color: rgba(247,147,26,0.6) !important; outline: none; }
+      `}</style>
     </div>
   )
 }

@@ -1,28 +1,30 @@
 // ─────────────────────────────────────────────
 // db.js — Bitsoko IndexedDB layer
-// Stores: products, stalls, profiles, orders, cart
-// Nostr is the source of truth — this is the cache
+//
+// Stores:
+//   products  → kind:30402 NIP-99 listings
+//   profiles  → kind:0 user profiles
+//   orders    → kind:4 encrypted DM orders
+//   cart      → local only, never on Nostr
+//
+// Nostr is the source of truth.
+// IndexedDB is the offline-first cache.
+//
+// KEY CHANGE from NIP-15:
+//   Products are now keyed by `pubkey:d-tag` (stableId)
+//   not by event.id hash. This means editing a product
+//   (same 'd' tag, new event) overwrites the same IndexedDB
+//   record — no duplicates, no ghost listings.
 // ─────────────────────────────────────────────
 
 const DB_NAME    = 'bitsoko_db'
-const DB_VERSION = 1
-
-// ── Schema ──────────────────────────────────
-// products  → kind:30018 nostr events
-// stalls    → kind:30017 nostr events
-// profiles  → kind:0 nostr events (pubkey → profile)
-// orders    → kind:4 encrypted DMs (local + nostr)
-// cart      → local only, never published to nostr
+const DB_VERSION = 2            // bumped — NIP-99 schema change
 
 const STORES = {
-  products: { keyPath: 'id',     indexes: [
+  products: { keyPath: 'id', indexes: [
     { name: 'pubkey',     field: 'pubkey',     unique: false },
     { name: 'created_at', field: 'created_at', unique: false },
-    { name: 'stall_id',   field: 'stall_id',   unique: false },
-  ]},
-  stalls: { keyPath: 'id', indexes: [
-    { name: 'pubkey',     field: 'pubkey',     unique: false },
-    { name: 'created_at', field: 'created_at', unique: false },
+    { name: 'status',     field: 'status',     unique: false },
   ]},
   profiles: { keyPath: 'pubkey', indexes: [
     { name: 'name', field: 'name', unique: false },
@@ -45,14 +47,29 @@ export function openDB() {
     const req = indexedDB.open(DB_NAME, DB_VERSION)
 
     req.onupgradeneeded = (e) => {
-      const db = e.target.result
+      const db      = e.target.result
+      const oldVer  = e.oldVersion
+
       for (const [storeName, config] of Object.entries(STORES)) {
         if (!db.objectStoreNames.contains(storeName)) {
           const store = db.createObjectStore(storeName, { keyPath: config.keyPath })
           for (const idx of config.indexes) {
             store.createIndex(idx.name, idx.field, { unique: idx.unique })
           }
+        } else if (oldVer < 2 && storeName === 'products') {
+          // v1→v2: drop old products store and recreate with new schema
+          // Old kind:30018 events are stale — users re-publish under NIP-99
+          db.deleteObjectStore(storeName)
+          const store = db.createObjectStore(storeName, { keyPath: config.keyPath })
+          for (const idx of config.indexes) {
+            store.createIndex(idx.name, idx.field, { unique: idx.unique })
+          }
         }
+      }
+
+      // Drop stalls store — NIP-99 has no stalls concept
+      if (db.objectStoreNames.contains('stalls')) {
+        db.deleteObjectStore('stalls')
       }
     }
 
@@ -73,45 +90,82 @@ function wrap(req) {
   })
 }
 
-// ── Products ──────────────────────────────────
+// ─────────────────────────────────────────────
+// PRODUCTS (kind:30402 NIP-99)
+// ─────────────────────────────────────────────
 
+// saveProduct accepts a raw Nostr event and parses it
+// using the NIP-99 tag structure (imported lazily to
+// avoid circular deps — nostrSync imports from db).
 export async function saveProduct(event) {
   await openDB()
-  // Parse kind:30018 content
-  let parsed = {}
-  try { parsed = JSON.parse(event.content) } catch {}
+
+  const tags   = event.tags || []
+  const tag    = (name) => tags.find(t  => t[0] === name)?.[1] || ''
+  const tagAll = (name) => tags.filter(t => t[0] === name)
+
+  // Stable ID = pubkey:d-tag (NIP-33 identity)
+  const dTag     = tag('d')
+  const stableId = dTag ? `${event.pubkey}:${dTag}` : event.id
+
+  const images = tagAll('image').map(t => t[1]).filter(Boolean)
+
+  const shipping = tagAll('shipping').map(t => ({
+    name:    t[1] || '',
+    cost:    parseInt(t[2]) || 0,
+    currency:t[3] || 'SATS',
+    regions: t[4] || '',
+  }))
+
+  const RESERVED = new Set(['bitsoko','bitcoin','deleted','active','sold'])
+  const categories = tagAll('t')
+    .map(t => t[1])
+    .filter(v => v && !RESERVED.has(v))
+
+  const priceTag = tags.find(t => t[0] === 'price')
+  const price    = priceTag ? parseInt(priceTag[1]) || 0 : 0
+  const currency = priceTag ? priceTag[2] || 'SATS' : 'SATS'
+
+  const qtyRaw  = tag('quantity')
+  const quantity = qtyRaw !== '' ? parseInt(qtyRaw) : -1
 
   const product = {
-    id:         event.id,
-    pubkey:     event.pubkey,
-    created_at: event.created_at,
-    tags:       event.tags || [],
-    // Parsed fields
-    name:       parsed.name        || '',
-    description:parsed.description || '',
-    price:      parsed.price       || 0,
-    currency:   parsed.currency    || 'SAT',
-    images:     parsed.images      || [],
-    stall_id:   parsed.stall_id    || '',
-    quantity:   parsed.quantity    != null ? parsed.quantity : -1,
-    shipping:   parsed.shipping    || [],
-    // Raw event for re-publishing
-    raw: event,
+    id:           stableId,                  // stable across edits
+    event_id:     event.id,                  // actual event hash
+    pubkey:       event.pubkey,
+    created_at:   event.created_at,
+    published_at: parseInt(tag('published_at')) || event.created_at,
+    tags:         event.tags,
+    // NIP-99 fields from tags
+    name:         tag('title'),
+    summary:      tag('summary'),
+    description:  event.content,             // Markdown
+    location:     tag('location'),
+    status:       tag('status') || 'active',
+    price,
+    currency,
+    images,
+    quantity,
+    shipping,
+    categories,
+    raw:          event,
   }
+
   return wrap(tx('products', 'readwrite').put(product))
 }
 
-export async function getProducts(limit = 50) {
+export async function getProducts(limit = 100) {
   await openDB()
   return new Promise((resolve, reject) => {
-    const store = tx('products')
-    const index = store.index('created_at')
+    const store   = tx('products')
+    const index   = store.index('created_at')
     const results = []
-    const req = index.openCursor(null, 'prev') // newest first
+    const req     = index.openCursor(null, 'prev') // newest first
     req.onsuccess = (e) => {
       const cursor = e.target.result
       if (cursor && results.length < limit) {
-        results.push(cursor.value)
+        // Only return active listings
+        if (cursor.value.status !== 'deleted') results.push(cursor.value)
         cursor.continue()
       } else {
         resolve(results)
@@ -128,7 +182,8 @@ export async function getProductById(id) {
 
 export async function getProductsByPubkey(pubkey) {
   await openDB()
-  return wrap(tx('products').index('pubkey').getAll(pubkey))
+  const all = await wrap(tx('products').index('pubkey').getAll(pubkey))
+  return all.filter(p => p.status !== 'deleted')
 }
 
 export async function deleteProduct(id) {
@@ -136,38 +191,9 @@ export async function deleteProduct(id) {
   return wrap(tx('products', 'readwrite').delete(id))
 }
 
-// ── Stalls ────────────────────────────────────
-
-export async function saveStall(event) {
-  await openDB()
-  let parsed = {}
-  try { parsed = JSON.parse(event.content) } catch {}
-
-  const stall = {
-    id:          event.id,
-    pubkey:      event.pubkey,
-    created_at:  event.created_at,
-    name:        parsed.name        || '',
-    description: parsed.description || '',
-    currency:    parsed.currency    || 'SAT',
-    shipping:    parsed.shipping    || [],
-    raw:         event,
-  }
-  return wrap(tx('stalls', 'readwrite').put(stall))
-}
-
-export async function getStalls() {
-  await openDB()
-  return wrap(tx('stalls').getAll())
-}
-
-export async function getStallByPubkey(pubkey) {
-  await openDB()
-  const results = await wrap(tx('stalls').index('pubkey').getAll(pubkey))
-  return results[0] || null
-}
-
-// ── Profiles ──────────────────────────────────
+// ─────────────────────────────────────────────
+// PROFILES (kind:0)
+// ─────────────────────────────────────────────
 
 export async function saveProfile(pubkey, content) {
   await openDB()
@@ -183,6 +209,7 @@ export async function saveProfile(pubkey, content) {
     lud16:        parsed.lud16        || '',
     nip05:        parsed.nip05        || '',
     website:      parsed.website      || '',
+    banner:       parsed.banner       || '',
     updated_at:   Math.floor(Date.now() / 1000),
   }
   return wrap(tx('profiles', 'readwrite').put(profile))
@@ -198,7 +225,9 @@ export async function getProfiles(pubkeys) {
   return Promise.all(pubkeys.map(pk => wrap(tx('profiles').get(pk))))
 }
 
-// ── Orders ────────────────────────────────────
+// ─────────────────────────────────────────────
+// ORDERS (kind:4 NIP-04 DMs stored locally)
+// ─────────────────────────────────────────────
 
 export async function saveOrder(order) {
   await openDB()
@@ -208,10 +237,10 @@ export async function saveOrder(order) {
 export async function getOrders() {
   await openDB()
   return new Promise((resolve, reject) => {
-    const store = tx('orders')
-    const index = store.index('created_at')
+    const store   = tx('orders')
+    const index   = store.index('created_at')
     const results = []
-    const req = index.openCursor(null, 'prev')
+    const req     = index.openCursor(null, 'prev')
     req.onsuccess = (e) => {
       const cursor = e.target.result
       if (cursor) { results.push(cursor.value); cursor.continue() }
@@ -225,13 +254,14 @@ export async function updateOrderStatus(id, status) {
   await openDB()
   const order = await wrap(tx('orders').get(id))
   if (!order) return
-  order.status = status
+  order.status     = status
   order.updated_at = Math.floor(Date.now() / 1000)
   return wrap(tx('orders', 'readwrite').put(order))
 }
 
-// ── Cart ──────────────────────────────────────
-// Cart is local only — never published to Nostr
+// ─────────────────────────────────────────────
+// CART (local only — never published)
+// ─────────────────────────────────────────────
 
 export async function addToCart(product, quantity = 1) {
   await openDB()

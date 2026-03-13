@@ -1,7 +1,44 @@
 import { useState } from 'react'
 import { getPublicKey, nip19 } from 'nostr-tools'
+import { SimplePool } from 'nostr-tools/pool'
 import { Eye, EyeOff, ArrowRight, ArrowLeft } from 'lucide-react'
 import { useNavigate } from 'react-router-dom'
+import { fetchAndSetUserRelays, DEFAULT_RELAYS } from '../lib/nostrSync'
+import { saveProfile } from '../lib/db'
+
+const FETCH_RELAYS = [
+  'wss://relay.damus.io',
+  'wss://nos.lol',
+  'wss://relay.primal.net',
+  'wss://relay.nostr.band',
+  'wss://nostr-pub.wellorder.net',
+]
+
+async function fetchAndCacheProfile(pubkeyHex) {
+  try {
+    const pool = new SimplePool()
+    const sub  = pool.subscribe(
+      FETCH_RELAYS,
+      [{ kinds: [0], authors: [pubkeyHex], limit: 1 }],
+      {
+        async onevent(e) {
+          try {
+            const p = JSON.parse(e.content)
+            await saveProfile(pubkeyHex, p)
+            const name = p.display_name || p.name || ''
+            if (name) localStorage.setItem('bitsoko_display_name', name)
+            if (p.lud16) localStorage.setItem('bitsoko_ln', p.lud16)
+            // Notify same-tab components that fresh profile data is ready
+            window.dispatchEvent(new Event('bitsoko_login'))
+          } catch {}
+          try { sub.close() } catch {}
+        },
+        oneose() { try { sub.close() } catch {} },
+      }
+    )
+    setTimeout(() => { try { sub.close() } catch {} }, 10000)
+  } catch {}
+}
 
 export default function Login({ onAuth }) {
   const navigate = useNavigate()
@@ -20,6 +57,12 @@ export default function Login({ onAuth }) {
       const pk = getPublicKey(sk)
       localStorage.setItem('bitsoko_nsec', nsec.trim())
       localStorage.setItem('bitsoko_npub', nip19.npubEncode(pk))
+      // Dispatch custom event so same-tab components react immediately
+      // (native 'storage' event only fires across tabs, not same tab)
+      window.dispatchEvent(new Event('bitsoko_login'))
+      // Background: fetch existing Nostr profile and relays
+      fetchAndCacheProfile(pk)
+      fetchAndSetUserRelays(pk)
       onAuth()
     } catch {
       setError('Invalid key — check and try again')
@@ -41,11 +84,7 @@ export default function Login({ onAuth }) {
       `}</style>
 
       {/* Topbar */}
-      <div style={{
-        padding: '16px 20px',
-        display: 'flex',
-        alignItems: 'center',
-      }}>
+      <div style={{ padding: '16px 20px', display: 'flex', alignItems: 'center' }}>
         <button onClick={() => navigate(-1)} style={{
           display: 'flex', alignItems: 'center', gap: '4px',
           background: 'none', border: 'none', fontSize: '13px',
@@ -59,7 +98,6 @@ export default function Login({ onAuth }) {
       {/* Content */}
       <div style={{ flex: 1, padding: '12px 20px 40px', maxWidth: '480px', width: '100%', margin: '0 auto' }}>
 
-        {/* Hero section */}
         <div style={{ marginBottom: '36px' }}>
           <div style={{
             display: 'inline-flex', alignItems: 'center', gap: '6px',
@@ -85,7 +123,6 @@ export default function Login({ onAuth }) {
           </div>
         </div>
 
-        {/* Input card */}
         <div style={{
           background: '#ffffff', borderRadius: '20px',
           border: '1px solid #e8e0d5',
@@ -148,14 +185,12 @@ export default function Login({ onAuth }) {
           </button>
         </div>
 
-        {/* Divider */}
         <div style={{ display: 'flex', alignItems: 'center', gap: '12px', margin: '20px 0' }}>
           <div style={{ flex: 1, height: '1px', background: '#e8e0d5' }} />
           <span style={{ fontSize: '12px', color: '#c9bdb0' }}>or</span>
           <div style={{ flex: 1, height: '1px', background: '#e8e0d5' }} />
         </div>
 
-        {/* Create account */}
         <button onClick={() => navigate('/create')} style={{
           width: '100%', padding: '15px', background: 'transparent',
           color: '#1a1410', border: '1.5px solid #d4c9b8', borderRadius: '12px',
@@ -166,7 +201,6 @@ export default function Login({ onAuth }) {
           Create New Account <ArrowRight size={15} />
         </button>
 
-        {/* Bottom note */}
         <div style={{
           marginTop: '40px', padding: '16px',
           background: '#ffffff', borderRadius: '14px',
