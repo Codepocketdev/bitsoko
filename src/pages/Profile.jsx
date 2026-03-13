@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { nip19 } from 'nostr-tools'
 import { finalizeEvent } from 'nostr-tools/pure'
@@ -9,8 +9,7 @@ import {
   Image, RefreshCw, X, Grid,
 } from 'lucide-react'
 import { getSecretKey, getPublicKeyHex, getWriteRelays, DEFAULT_RELAYS, uploadImage } from '../lib/nostrSync'
-import { saveProfile } from '../lib/db'
-import { useNostrProfile } from '../hooks/useNostrProfile'
+import { saveProfile, getProfile } from '../lib/db'
 
 const C = {
   bg:     '#f7f4f0',
@@ -26,6 +25,7 @@ const C = {
   green:  '#22c55e',
 }
 
+// Hardcoded — don't depend on NIP-65 loading, works immediately on mount
 const FETCH_RELAYS = [
   'wss://relay.damus.io',
   'wss://nos.lol',
@@ -45,49 +45,93 @@ const FIELDS = [
 ]
 
 export default function Profile() {
-  const navigate = useNavigate()
+  const navigate  = useNavigate()
+  const subRef    = useRef(null)
 
-  // Get pubkey — read once on mount, stable
-  const pubkeyHex = (() => { try { return getPublicKeyHex() } catch { return '' } })()
+  // Reactive pubkey — updates if localStorage is set after initial render (e.g. fresh login)
+  const [pubkeyHex, setPubkeyHex] = useState(() => {
+    try { return getPublicKeyHex() } catch { return '' }
+  })
+
+  // Listen for bitsoko_npub being set (happens right after login)
+  useEffect(() => {
+    const onStorage = () => {
+      try { setPubkeyHex(getPublicKeyHex()) } catch {}
+    }
+    window.addEventListener('storage', onStorage)
+    // Also poll once immediately in case same-tab login just happened
+    try { const k = getPublicKeyHex(); if (k) setPubkeyHex(k) } catch {}
+    return () => window.removeEventListener('storage', onStorage)
+  }, [])
+
   const npub      = pubkeyHex ? nip19.npubEncode(pubkeyHex) : ''
   const nsec      = (() => { try { return nip19.nsecEncode(getSecretKey()) } catch { return '' } })()
   const shortNpub = npub ? `${npub.slice(0,16)}…${npub.slice(-8)}` : ''
 
-  // ── useNostrProfile: IndexedDB first, relay second, saves back to IndexedDB
-  // This is the GradeBase pattern — zero flash on re-login
-  const { profile, loading } = useNostrProfile(pubkeyHex)
+  const [form,        setForm]        = useState({})
+  const [fetched,     setFetched]     = useState(null)
+  const [fetchStatus, setFetchStatus] = useState('loading')
+  const [saving,      setSaving]      = useState(false)
+  const [saved,       setSaved]       = useState(false)
+  const [error,       setError]       = useState('')
+  const [showNsec,    setShowNsec]    = useState(false)
+  const [copied,      setCopied]      = useState('')
+  const [uploading,   setUploading]   = useState(null)
+  const [showQR,      setShowQR]      = useState(false)
+  const [refreshing,  setRefreshing]  = useState(false)
 
-  // Form state — hydrated from hook, only fills empty fields so edits aren't clobbered
-  const [form, setForm] = useState({})
-
-  useEffect(() => {
-    if (!profile) return
+  const fillForm = (p) => {
+    setFetched(p)
     setForm(prev => {
       const merged = { ...prev }
-      FIELDS.forEach(({ key }) => {
-        if (profile[key] && !prev[key]) merged[key] = profile[key]
-      })
+      FIELDS.forEach(({ key }) => { if (p[key]) merged[key] = p[key] })
       return merged
     })
-    // Cache display name and ln for home screen
-    if (profile.display_name || profile.name) {
-      localStorage.setItem('bitsoko_display_name', profile.display_name || profile.name)
-    }
-    if (profile.lud16) localStorage.setItem('bitsoko_ln', profile.lud16)
-  }, [profile])
+    setFetchStatus('found')
+    if (p.display_name || p.name) localStorage.setItem('bitsoko_display_name', p.display_name || p.name)
+    if (p.lud16) localStorage.setItem('bitsoko_ln', p.lud16)
+  }
 
-  const [saving,    setSaving]    = useState(false)
-  const [saved,     setSaved]     = useState(false)
-  const [error,     setError]     = useState('')
-  const [showNsec,  setShowNsec]  = useState(false)
-  const [copied,    setCopied]    = useState('')
-  const [uploading, setUploading] = useState(null)
-  const [showQR,    setShowQR]    = useState(false)
-  const [refreshing,setRefreshing]= useState(false)
+  useEffect(() => {
+    if (!pubkeyHex) { setFetchStatus('empty'); return }
+
+    // Step 1: instant from IndexedDB
+    getProfile(pubkeyHex).then(cached => {
+      if (cached && (cached.name || cached.display_name || cached.about)) {
+        fillForm(cached)
+      } else {
+        const n = localStorage.getItem('bitsoko_display_name')
+        const l = localStorage.getItem('bitsoko_ln')
+        if (n) setForm(prev => ({ ...prev, display_name: n, name: n }))
+        if (l) setForm(prev => ({ ...prev, lud16: l }))
+      }
+    }).catch(() => {})
+
+    // Step 2: live WebSocket — hardcoded relays, no async dependency
+    const pool = new SimplePool()
+    const sub  = pool.subscribe(
+      FETCH_RELAYS,
+      [{ kinds: [0], authors: [pubkeyHex], limit: 1 }],
+      {
+        onevent(e) {
+          try { const p = JSON.parse(e.content); fillForm(p); saveProfile(pubkeyHex, p).catch(() => {}) } catch {}
+        },
+        oneose() {
+          try { sub.close() } catch {}
+          setFetchStatus(prev => prev === 'loading' ? 'empty' : prev)
+        },
+      }
+    )
+    subRef.current = sub
+    const t = setTimeout(() => {
+      try { sub.close() } catch {}
+      setFetchStatus(prev => prev === 'loading' ? 'empty' : prev)
+    }, 10000)
+
+    return () => { clearTimeout(t); try { subRef.current?.close() } catch {} }
+  }, [pubkeyHex])
 
   const set = (key, val) => setForm(prev => ({ ...prev, [key]: val }))
-
-  const fetchStatus = loading ? 'loading' : profile ? 'found' : 'empty'
 
   const handleRefresh = async () => {
     if (!pubkeyHex) return
@@ -97,9 +141,8 @@ export default function Profile() {
       const events = await pool.querySync(FETCH_RELAYS, { kinds: [0], authors: [pubkeyHex], limit: 1 })
       if (!events.length) throw new Error('No profile found on relays')
       const p = JSON.parse(events[0].content)
+      fillForm(p)
       await saveProfile(pubkeyHex, p)
-      setForm({})
-      FIELDS.forEach(({ key }) => { if (p[key]) setForm(prev => ({ ...prev, [key]: p[key] })) })
     } catch (e) { setError(e.message || 'Refresh failed') }
     setRefreshing(false)
   }
@@ -107,7 +150,7 @@ export default function Profile() {
   const handleSave = async () => {
     setSaving(true); setError(''); setSaved(false)
     try {
-      const payload = { ...(profile || {}), ...form }
+      const payload = { ...(fetched || {}), ...form }
       Object.keys(payload).forEach(k => { if (!payload[k]) delete payload[k] })
       const sk     = getSecretKey()
       const relays = [...new Set([...getWriteRelays(), ...DEFAULT_RELAYS])]
@@ -117,6 +160,7 @@ export default function Profile() {
       }, sk)
       await Promise.any(new SimplePool().publish(relays, event))
       await saveProfile(pubkeyHex, payload)
+      fillForm(payload)
       setSaved(true)
       setTimeout(() => setSaved(false), 3000)
     } catch (e) { setError(e.message || 'Publish failed') }
@@ -135,8 +179,8 @@ export default function Profile() {
     try { await navigator.clipboard.writeText(text); setCopied(label); setTimeout(() => setCopied(''), 2000) } catch {}
   }
 
-  const avatar   = form.picture || profile?.picture
-  const dispName = form.display_name || form.name || profile?.display_name || profile?.name || shortNpub
+  const avatar   = form.picture || fetched?.picture
+  const dispName = form.display_name || form.name || fetched?.display_name || fetched?.name || shortNpub
 
   return (
     <div style={{ minHeight: '100vh', background: C.bg, paddingBottom: 100 }}>
@@ -168,7 +212,7 @@ export default function Profile() {
       </div>
 
       {/* Avatar row */}
-      <div style={{ background: C.white, padding: '20px 16px', marginBottom: 10, borderBottom: `1px solid ${C.border}` }}>
+      <div style={{ background: C.white, padding: '20px 16px 20px', marginBottom: 10, borderBottom: `1px solid ${C.border}` }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
           <label style={{ cursor: 'pointer', position: 'relative', flexShrink: 0 }}>
             <div style={{
@@ -202,12 +246,11 @@ export default function Profile() {
           </label>
 
           <div style={{ flex: 1, minWidth: 0 }}>
-            <div style={{ fontSize: 18, fontWeight: 800, color: C.black }}>
-              {loading && !profile ? '…' : dispName}
-            </div>
-            {(form.lud16 || profile?.lud16) && (
-              <div style={{ fontSize: 12, color: C.sage, display: 'flex', alignItems: 'center', gap: 4, marginTop: 2 }}>
-                <Zap size={11} /> {form.lud16 || profile?.lud16}
+            <div style={{ fontSize: 18, fontWeight: 800, color: C.black }}>{dispName}</div>
+            {(form.lud16 || fetched?.lud16) && (
+              <div style={{ fontSize: 12, color: C.sage, display: 'flex', alignItems: 'flex-start', gap: 4, marginTop: 2 }}>
+                <Zap size={11} style={{ flexShrink: 0, marginTop: 1 }} />
+                <span style={{ wordBreak: 'break-all', lineHeight: 1.4 }}>{form.lud16 || fetched?.lud16}</span>
               </div>
             )}
             <div style={{ fontSize: 11, color: C.muted, fontFamily: 'monospace', marginTop: 4, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{shortNpub}</div>
@@ -267,7 +310,7 @@ export default function Profile() {
               <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 6 }}>
                 <Icon size={12} color={C.muted} />
                 <span style={{ fontSize: 12, color: C.black, fontWeight: 600 }}>{label}</span>
-                {profile?.[key] && form[key] === profile[key] && (
+                {fetched?.[key] && form[key] === fetched[key] && (
                   <span style={{ marginLeft: 'auto', fontSize: 10, color: C.sage, background: 'rgba(45,106,79,0.08)', padding: '2px 7px', borderRadius: 4, border: '1px solid rgba(45,106,79,0.2)' }}>
                     from Nostr ✓
                   </span>
@@ -301,17 +344,14 @@ export default function Profile() {
 
         <button onClick={handleSave} disabled={saving} style={{
           width: '100%', padding: 16, borderRadius: 14, border: 'none',
-          background: saved ? C.muted : C.black,
+          background: saved ? `linear-gradient(135deg,#9e9890,#7a7068)` : `linear-gradient(135deg,${C.orange},${C.terra})`,
           color: '#fff', fontWeight: 800, fontSize: 16, cursor: saving ? 'default' : 'pointer',
           display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 10,
-          opacity: saving ? 0.7 : 1, transition: 'all 0.3s',
+          opacity: saving ? 0.7 : 1, transition: 'all 0.3s', boxShadow: '0 4px 20px rgba(247,147,26,0.3)',
         }}>
-          {saving
-            ? <><div style={{ width: 16, height: 16, borderRadius: '50%', border: '2px solid rgba(255,255,255,0.4)', borderTopColor: '#fff', animation: 'spin .7s linear infinite' }} /> Publishing…</>
-            : saved
-            ? <><Check size={18} /> Saved to Nostr</>
-            : <><Save size={18} /> Save Profile</>
-          }
+          {saving ? <><div style={{ width: 16, height: 16, borderRadius: '50%', border: '2px solid rgba(255,255,255,0.4)', borderTopColor: '#fff', animation: 'spin .7s linear infinite' }} /> Publishing…</>
+            : saved ? <><Check size={18} /> Saved to Nostr</>
+            : <><Save size={18} /> Save Profile</>}
         </button>
         <div style={{ marginTop: 10, fontSize: 11, color: C.muted, textAlign: 'center' }}>
           Publishes kind:0 · visible on Damus, Amethyst, Primal and all Nostr clients

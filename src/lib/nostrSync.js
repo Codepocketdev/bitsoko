@@ -3,9 +3,14 @@
 //
 // Pattern based on Shopstr (shopstr-eng/shopstr) open source:
 //   1. Load IndexedDB instantly → show UI
-//   2. Fetch kind:30402 from relays → merge (newer created_at wins)
-//   3. Cache back to IndexedDB
-//   4. Use user's NIP-65 relay list (kind:10002) for writes
+//   2. Fetch kind:30402 from relays — NO authors filter (global feed)
+//   3. Merge: newer created_at wins for same pubkey:d-tag key
+//   4. Cache back to IndexedDB
+//   5. Use user's NIP-65 relay list (kind:10002) for writes
+//
+// KEY FIX: fetchAndSeed now uses pool.querySync() not pool.subscribe()
+//   subscribe() fires EOSE before all relays respond → missed events
+//   querySync() awaits ALL relays properly → guaranteed results
 //
 // EVENT KINDS:
 //   kind:0     — Profile (NIP-01)
@@ -38,9 +43,6 @@ import {
 } from './db'
 
 // ── Default fallback relays ───────────────────
-// Used only if user has no NIP-65 relay list.
-// These are free public relays confirmed to index kind:30402.
-// Shopstr uses: nos.lol, relay.damus.io, sendit.nosflare.com
 export const DEFAULT_RELAYS = [
   'wss://relay.damus.io',
   'wss://nos.lol',
@@ -51,7 +53,6 @@ export const DEFAULT_RELAYS = [
 ]
 
 // Runtime relay list — populated from user's kind:10002 on login
-// Falls back to DEFAULT_RELAYS if not set
 let _userRelays      = []
 let _userWriteRelays = []
 
@@ -64,7 +65,6 @@ export function setUserRelays(relays, writeRelays) {
 export function getReadRelays()  { return _userRelays.length      ? _userRelays      : DEFAULT_RELAYS }
 export function getWriteRelays() { return _userWriteRelays.length ? _userWriteRelays : DEFAULT_RELAYS }
 
-// Keep RELAYS export for backwards compat
 export const RELAYS = DEFAULT_RELAYS
 
 // ── Nostr event kinds ─────────────────────────
@@ -105,8 +105,8 @@ export function getPublicKeyHex() {
 }
 
 // ── Stable dedup key (same as Shopstr's getEventKey) ──
-// For kind:30402: pubkey + d-tag = identity
-// Two events same pubkey+d = same product, newer wins
+// For kind:30402: pubkey + d-tag = product identity
+// Same pubkey+d = same product, newer created_at wins
 function stableKey(event) {
   const dTag = (event.tags || []).find(t => t[0] === 'd')?.[1]
   return dTag ? `${event.pubkey}:${dTag}` : event.id
@@ -124,8 +124,6 @@ function isDeleted(event) {
 
 // ─────────────────────────────────────────────
 // FETCH USER'S NIP-65 RELAY LIST (kind:10002)
-// Call this right after login so publish goes to
-// the user's own relays — same pattern Shopstr uses.
 // ─────────────────────────────────────────────
 export async function fetchAndSetUserRelays(pubkeyHex) {
   try {
@@ -135,13 +133,12 @@ export async function fetchAndSetUserRelays(pubkeyHex) {
       [{ kinds: [KINDS.RELAY_LIST], authors: [pubkeyHex], limit: 1 }],
       {
         onevent(event) {
-          const tags       = event.tags || []
+          const tags        = event.tags || []
           const readRelays  = tags.filter(t => t[0] === 'r' && (!t[2] || t[2] === 'read')).map(t => t[1]).filter(Boolean)
           const writeRelays = tags.filter(t => t[0] === 'r' && (!t[2] || t[2] === 'write')).map(t => t[1]).filter(Boolean)
           const allRelays   = tags.filter(t => t[0] === 'r' && !t[2]).map(t => t[1]).filter(Boolean)
-
-          const finalRead  = readRelays.length  ? readRelays  : allRelays
-          const finalWrite = writeRelays.length ? writeRelays : allRelays
+          const finalRead   = readRelays.length  ? readRelays  : allRelays
+          const finalWrite  = writeRelays.length ? writeRelays : allRelays
           setUserRelays(finalRead, finalWrite)
           sub.close()
         },
@@ -156,141 +153,129 @@ export async function fetchAndSetUserRelays(pubkeyHex) {
 
 // ─────────────────────────────────────────────
 // FETCH & SEED
-// Shopstr pattern:
-//   1. Load IndexedDB (instant UI) — done in Home.jsx already
-//   2. Fetch { kinds: [30402] } from relays — no hashtag filter
-//   3. Merge: newer created_at wins for same pubkey:d-tag key
-//   4. Save merged result to IndexedDB
 //
-// FIX 2 — "broader relay list":
-//   Read relays = user's NIP-65 relays UNION DEFAULT_RELAYS
-//   so we always hit the big public relays AND the user's own
-//   relays where their listings were published.
+// THE FIX: use pool.querySync() not pool.subscribe()
 //
-// FIX 3 — real merge logic:
-//   seenMap = Map<stableKey, created_at>
-//   On duplicate key: only process if event is NEWER than what we saw
-//   This means the most recent version of each listing wins,
-//   regardless of relay delivery order.
+// pool.subscribe() fires oneose callback before all relays have
+// responded — especially slow or freshly-connected relays. This
+// caused cross-user products to be invisible and cleared-data
+// to never repopulate, because those events arrived after EOSE.
+//
+// pool.querySync() properly awaits ALL relays and returns a
+// complete array — same fix that solved the Profile page issue.
+//
+// Shopstr strategy:
+//   filter = { kinds: [30402] }  ← NO authors filter (global feed)
+//   merge  = newer created_at wins for same pubkey:d-tag key
+//   cache  = save everything to IndexedDB for next load
 // ─────────────────────────────────────────────
-export function fetchAndSeed({ onProduct, onProfile, onDone } = {}) {
-  return new Promise((resolve) => {
-    const pool = getPool()
+export async function fetchAndSeed({ onProduct, onProfile, onDone } = {}) {
+  const pool = getPool()
 
-    // FIX 2: union of user relays + defaults so we never miss own listings
-    const readRelays = getReadRelays()
-    const relays     = [...new Set([...readRelays, ...DEFAULT_RELAYS])]
+  // Always use union of user relays + DEFAULT_RELAYS
+  // This ensures we hit public relays AND the user's own relays
+  const relays = [...new Set([...getReadRelays(), ...DEFAULT_RELAYS])]
 
-    // FIX 3: Map<stableKey, created_at> — newer event always wins
-    const seenMap        = new Map()   // key → created_at of best version seen
+  console.log('[bitsoko] fetchAndSeed —', relays.length, 'relays, filter: { kinds: [30402] }')
+
+  try {
+    // ── Step 1: Fetch ALL listings from ALL relays
+    // querySync awaits every relay properly — no missed events
+    const [listingEvents, draftEvents] = await Promise.all([
+      pool.querySync(relays, { kinds: [KINDS.LISTING],       limit: 500 }).catch(() => []),
+      pool.querySync(relays, { kinds: [KINDS.LISTING_DRAFT], limit: 200 }).catch(() => []),
+    ])
+
+    const allEvents = [...listingEvents, ...draftEvents]
+    console.log(`[bitsoko] querySync returned ${allEvents.length} raw events from ${relays.length} relays`)
+
+    // ── Step 2: Merge — newer created_at wins for same pubkey:d-tag
+    // Matches Shopstr's mergedProductsMap logic exactly
+    const mergedMap = new Map()
+    for (const event of allEvents) {
+      const key      = stableKey(event)
+      const existing = mergedMap.get(key)
+      if (!existing || event.created_at >= existing.created_at) {
+        mergedMap.set(key, event)
+      }
+    }
+
+    console.log(`[bitsoko] ${mergedMap.size} unique listings after merge`)
+
+    // ── Step 3: Save to IndexedDB + collect seller pubkeys
     const profilePubkeys = new Set()
+    for (const [key, event] of mergedMap) {
+      if (isDeleted(event)) {
+        await deleteProduct(key).catch(() => {})
+      } else if (event.kind === KINDS.LISTING) {
+        await saveProduct(event)
+        profilePubkeys.add(event.pubkey)
+        onProduct?.(event)
+      }
+    }
 
-    console.log('[bitsoko] fetchAndSeed —', relays.length, 'relays, filter: { kinds: [30402] }')
+    // ── Step 4: If still 0 results, fallback to own pubkey on write relays
+    // Handles the edge case where the user just published and global
+    // relays haven't indexed it yet — fetch directly from write relays
+    if (mergedMap.size === 0) {
+      console.log('[bitsoko] 0 global results — running own-pubkey fallback on write relays')
+      try {
+        const npub = localStorage.getItem('bitsoko_npub')
+        if (npub) {
+          const { data: myPubkey } = nip19.decode(npub)
+          const writeRelays = [...new Set([...getWriteRelays(), ...DEFAULT_RELAYS])]
+          const fallback = await pool.querySync(
+            writeRelays,
+            { kinds: [KINDS.LISTING], authors: [myPubkey], limit: 100 }
+          ).catch(() => [])
 
-    const sub = pool.subscribe(
-      relays,
-      [
-        { kinds: [KINDS.LISTING],       limit: 500 },
-        { kinds: [KINDS.LISTING_DRAFT], limit: 200 },
-      ],
-      {
-        async onevent(event) {
-          const key      = stableKey(event)
-          const existing = seenMap.get(key)
-
-          // FIX 3: skip if we already have a newer version of this listing
-          if (existing !== undefined && event.created_at <= existing) return
-          seenMap.set(key, event.created_at)
-
-          if (isDeleted(event)) {
-            await deleteProduct(key)
-            return
-          }
-
-          if (event.kind === KINDS.LISTING) {
-            await saveProduct(event)          // IndexedDB upsert — newer wins
-            profilePubkeys.add(event.pubkey)
-            onProduct?.(event)
-          }
-        },
-
-        async oneose() {
-          console.log(`[bitsoko] EOSE — ${seenMap.size} unique listings from ${relays.length} relays`)
-          sub.close()
-
-          // FIX 2 FALLBACK: if still 0 results, fetch by own pubkey explicitly
-          // Handles case: user just published, relays haven't propagated globally yet
-          if (seenMap.size === 0) {
-            console.log('[bitsoko] 0 events globally — running own-pubkey fallback')
-            const npub = localStorage.getItem('bitsoko_npub')
-            if (npub) {
-              try {
-                const { data: myPubkey } = nip19.decode(npub)
-                // Use write relays (where we published) for the fallback
-                const writeRelays = [...new Set([...getWriteRelays(), ...DEFAULT_RELAYS])]
-                const fallbackSub = pool.subscribe(
-                  writeRelays,
-                  [{ kinds: [KINDS.LISTING], authors: [myPubkey], limit: 100 }],
-                  {
-                    async onevent(e) {
-                      const key      = stableKey(e)
-                      const existing = seenMap.get(key)
-                      if (existing !== undefined && e.created_at <= existing) return
-                      seenMap.set(key, e.created_at)
-                      if (isDeleted(e)) { await deleteProduct(key); return }
-                      await saveProduct(e)
-                      profilePubkeys.add(e.pubkey)
-                      onProduct?.(e)
-                      console.log('[bitsoko] fallback ✓', key)
-                    },
-                    oneose() { fallbackSub.close() },
-                  }
-                )
-                setTimeout(() => { try { fallbackSub.close() } catch {} }, 6000)
-              } catch(e) { console.warn('[bitsoko] fallback error:', e) }
+          for (const event of fallback) {
+            if (!isDeleted(event)) {
+              await saveProduct(event)
+              profilePubkeys.add(event.pubkey)
+              onProduct?.(event)
+              console.log('[bitsoko] fallback ✓', stableKey(event))
             }
           }
+        }
+      } catch(e) { console.warn('[bitsoko] fallback error:', e) }
+    }
 
-          // Fetch kind:0 profiles for all sellers we found
-          if (profilePubkeys.size > 0) {
-            const pubkeyArr = [...profilePubkeys]
-            const profSub   = pool.subscribe(
-              relays,
-              [{ kinds: [KINDS.PROFILE], authors: pubkeyArr, limit: pubkeyArr.length * 2 }],
-              {
-                async onevent(e) {
-                  await saveProfile(e.pubkey, e.content)
-                  onProfile?.(e)
-                },
-                oneose() {
-                  try { profSub.close() } catch {}
-                  onDone?.()
-                  resolve()
-                },
-              }
-            )
-            setTimeout(() => { try { profSub.close() } catch {} onDone?.(); resolve() }, 8000)
-          } else {
-            onDone?.()
-            resolve()
-          }
-        },
+    // ── Step 5: Fetch kind:0 profiles for all sellers we found
+    if (profilePubkeys.size > 0) {
+      const pubkeyArr = [...profilePubkeys]
+      const profiles  = await pool.querySync(
+        relays,
+        { kinds: [KINDS.PROFILE], authors: pubkeyArr, limit: pubkeyArr.length * 2 }
+      ).catch(() => [])
+
+      for (const e of profiles) {
+        await saveProfile(e.pubkey, e.content)
+        onProfile?.(e)
       }
-    )
+    }
 
-    setTimeout(() => { try { sub.close() } catch {} resolve() }, 15000)
-  })
+  } catch(e) {
+    console.error('[bitsoko] fetchAndSeed error:', e)
+  }
+
+  onDone?.()
 }
 
 // ─────────────────────────────────────────────
 // LIVE SYNC — persistent WebSocket for new listings
+// Uses union of user relays + DEFAULT_RELAYS so live
+// updates work regardless of relay config state
 // ─────────────────────────────────────────────
 export function startSync({ onProduct, onProfile } = {}) {
   stopSync()
 
   const pool  = getPool()
   const since = Math.floor(Date.now() / 1000)
-  const relays = getReadRelays()
+
+  // FIX: union relays same as fetchAndSeed — live sync was missing
+  // public relays when user had their own relay list set
+  const relays = [...new Set([...getReadRelays(), ...DEFAULT_RELAYS])]
 
   _liveSub = pool.subscribe(
     relays,
@@ -327,9 +312,9 @@ export function stopSync() {
 }
 
 async function fetchProfileIfMissing(pubkey) {
-  const pool  = getPool()
-  const relays = getReadRelays()
-  const sub   = pool.subscribe(
+  const pool   = getPool()
+  const relays = [...new Set([...getReadRelays(), ...DEFAULT_RELAYS])]
+  const sub    = pool.subscribe(
     relays,
     [{ kinds: [KINDS.PROFILE], authors: [pubkey], limit: 1 }],
     {
@@ -342,9 +327,6 @@ async function fetchProfileIfMissing(pubkey) {
 
 // ─────────────────────────────────────────────
 // PUBLISH LISTING (kind:30402 — NIP-99)
-// Publishes to user's OWN write relays (kind:10002)
-// so the listing lands where THEY can receive it.
-// Falls back to DEFAULT_RELAYS.
 // ─────────────────────────────────────────────
 export async function publishProduct({
   name,
@@ -359,11 +341,11 @@ export async function publishProduct({
   status      = 'active',
   productId   = null,
 }) {
-  const sk      = getSecretKey()
-  const pk      = getPublicKeyHex()
-  const now     = Math.floor(Date.now() / 1000)
-  const id      = productId || `bitsoko-${now}-${pk.slice(0, 8)}`
-  const relays  = getWriteRelays()
+  const sk     = getSecretKey()
+  const pk     = getPublicKeyHex()
+  const now    = Math.floor(Date.now() / 1000)
+  const id     = productId || `bitsoko-${now}-${pk.slice(0, 8)}`
+  const relays = getWriteRelays()
 
   const tags = [
     ['d',            id],
@@ -391,10 +373,13 @@ export async function publishProduct({
   // Save to IndexedDB immediately (optimistic UI)
   await saveProduct(event)
 
-  // Publish to ALL write relays — same as Shopstr's approach
-  console.log('[bitsoko] publishing to', relays.length, 'relays...')
+  // Publish to write relays + DEFAULT_RELAYS so the listing
+  // lands on public relays immediately for global visibility
+  const publishRelays = [...new Set([...relays, ...DEFAULT_RELAYS])]
+  console.log('[bitsoko] publishing to', publishRelays.length, 'relays...')
+
   const results = await Promise.allSettled(
-    relays.map(relay =>
+    publishRelays.map(relay =>
       Promise.race([
         getPool().publish([relay], event)
           .then(() => console.log('[bitsoko] ✓', relay))
@@ -406,7 +391,7 @@ export async function publishProduct({
 
   const ok   = results.filter(r => r.status === 'fulfilled').length
   const fail = results.filter(r => r.status === 'rejected').map(r => r.reason?.message)
-  console.log(`[bitsoko] published to ${ok}/${relays.length} relays`)
+  console.log(`[bitsoko] published to ${ok}/${publishRelays.length} relays`)
   if (fail.length) console.warn('[bitsoko] failed relays:', fail)
 
   return event
@@ -421,7 +406,7 @@ export async function deleteProductEvent(productId) {
   if (!product) throw new Error('Product not found in local DB')
 
   const dTag   = (product.tags || []).find(t => t[0] === 'd')?.[1] || productId
-  const relays = getWriteRelays()
+  const relays = [...new Set([...getWriteRelays(), ...DEFAULT_RELAYS])]
 
   // Layer 1: NIP-09 kind:5
   const kind5 = finalizeEvent({
@@ -507,9 +492,9 @@ export async function buildNip98Auth(uploadUrl, method = 'POST') {
 // ─────────────────────────────────────────────
 export async function uploadImage(file) {
   const PROVIDERS = [
-    { name: 'nostr.build',       url: 'https://nostr.build/api/v2/upload/files',  field: 'fileToUpload', getUrl: j => j?.data?.[0]?.url,             needsAuth: true  },
-    { name: 'nostrcheck.me',     url: 'https://nostrcheck.me/api/v2/media',        field: 'uploadedfile', getUrl: j => j?.url || j?.data?.url,         needsAuth: true  },
-    { name: 'nostr.build legacy',url: 'https://nostr.build/api/upload/image',      field: 'fileToUpload', getUrl: j => j?.data?.display_url||j?.data?.url, needsAuth: false },
+    { name: 'nostr.build',        url: 'https://nostr.build/api/v2/upload/files',   field: 'fileToUpload', getUrl: j => j?.data?.[0]?.url,                  needsAuth: true  },
+    { name: 'nostrcheck.me',      url: 'https://nostrcheck.me/api/v2/media',         field: 'uploadedfile', getUrl: j => j?.url || j?.data?.url,              needsAuth: true  },
+    { name: 'nostr.build legacy', url: 'https://nostr.build/api/upload/image',       field: 'fileToUpload', getUrl: j => j?.data?.display_url || j?.data?.url, needsAuth: false },
   ]
 
   let lastError = 'All upload providers failed'
@@ -519,7 +504,7 @@ export async function uploadImage(file) {
       formData.append(p.field, file)
       const headers = {}
       if (p.needsAuth) { try { headers['Authorization'] = await buildNip98Auth(p.url) } catch {} }
-      const res = await fetch(p.url, { method: 'POST', headers, body: formData })
+      const res  = await fetch(p.url, { method: 'POST', headers, body: formData })
       if (!res.ok) { lastError = `${p.name}: HTTP ${res.status}`; continue }
       const json = await res.json()
       const url  = p.getUrl(json)

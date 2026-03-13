@@ -135,7 +135,7 @@ function ProductCard({ product, profile, onClick }) {
           <Zap size={10} fill={C.orange} color={C.orange}/>
           <span style={{
             fontFamily: "'Inter',sans-serif",
-            fontSize: '0.65rem', fontWeight: 700, color: C.white,
+            fontSize: 10, fontWeight: 700, color: C.white,
           }}>
             {price.toLocaleString()} sats
           </span>
@@ -145,20 +145,20 @@ function ProductCard({ product, profile, onClick }) {
       <div style={{ padding: '10px 12px 12px' }}>
         <div style={{
           fontFamily: "'Inter',sans-serif",
-          fontSize: '0.82rem', fontWeight: 600,
+          fontSize: 13, fontWeight: 600,
           color: C.black, marginBottom: 2,
           overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
         }}>
           {name}
         </div>
-        <div style={{ fontFamily: "'Inter',sans-serif", fontSize: '0.68rem', color: C.muted, marginBottom: 6 }}>
+        <div style={{ fontFamily: "'Inter',sans-serif", fontSize: 11, color: C.muted, marginBottom: 6 }}>
           {satsToKsh(price)}
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
           <Avatar profile={profile} pubkey={product.pubkey} size={16}/>
           <span style={{
             fontFamily: "'Inter',sans-serif",
-            fontSize: '0.65rem', color: C.muted,
+            fontSize: 10, color: C.muted,
             overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
           }}>
             {sellerName}
@@ -181,18 +181,13 @@ export default function Home() {
   const [selectedCat, setSelectedCat] = useState(null)
   const [searchQuery, setSearchQuery] = useState('')
 
-  // ── Display name: useNostrProfile hook (IndexedDB first, relay second)
-  // Same pattern as Profile page — no waiting, no flash, works on re-login
   const _pubkeyHex = (() => { try { return getPublicKeyHex() } catch { return '' } })()
   const { profile: _userProfile } = useNostrProfile(_pubkeyHex)
 
-  // null  = still resolving (show nothing)
-  // string = resolved (show name, or 'there' if not found)
   const [displayName, setDisplayName] = useState(
     () => localStorage.getItem('bitsoko_display_name') || null
   )
 
-  // Update name when hook resolves from IndexedDB (instant) or relay (fresh)
   useEffect(() => {
     if (!_userProfile) return
     const n = _userProfile.display_name || _userProfile.name
@@ -200,12 +195,10 @@ export default function Home() {
       setDisplayName(n)
       localStorage.setItem('bitsoko_display_name', n)
     } else {
-      // Profile fetched but no name — now safe to show fallback
       setDisplayName(prev => prev || 'there')
     }
   }, [_userProfile])
 
-  // Also catch same-tab bitsoko_login event as an instant fallback
   useEffect(() => {
     const onLogin = () => {
       const n = localStorage.getItem('bitsoko_display_name')
@@ -384,10 +377,10 @@ export default function Home() {
       }}>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
           <div>
-            <div style={{ fontSize: '0.72rem', color: C.muted }}>Good day,</div>
-            <div style={{ fontSize: '1.1rem', fontWeight: 700, color: C.black }}>
+            <div style={{ fontSize: 11, color: C.muted }}>Good day,</div>
+            <div style={{ fontSize: 18, fontWeight: 700, color: C.black }}>
               {displayName === null
-                ? <span style={{ display: 'inline-block', width: 80, height: 16, borderRadius: 6, background: C.white, verticalAlign: 'middle' }} />
+                ? <span style={{ display: 'inline-block', width: 80, height: 16, borderRadius: 6, background: C.border, verticalAlign: 'middle' }} />
                 : displayName
               }
             </div>
@@ -400,7 +393,7 @@ export default function Home() {
                 style={{
                   background: C.orange, border: 'none', borderRadius: 99,
                   padding: '4px 10px', cursor: 'pointer',
-                  fontSize: '0.65rem', fontWeight: 700, color: C.white,
+                  fontSize: 10, fontWeight: 700, color: C.white,
                   display: 'flex', alignItems: 'center', gap: 4,
                 }}
               >
@@ -431,7 +424,7 @@ export default function Home() {
             placeholder="Search products, sellers…"
             style={{
               flex: 1, border: 'none', background: 'none',
-              outline: 'none', fontSize: '0.85rem',
+              outline: 'none', fontSize: 14,
               color: C.black, fontFamily: "'Inter',sans-serif",
             }}
           />
@@ -455,7 +448,7 @@ export default function Home() {
               transition: 'background 0.6s ease',
             }}/>
             <div style={{
-              fontSize: '0.65rem', fontWeight: 700,
+              fontSize: 10, fontWeight: 700,
               color: BANNERS[bannerIdx].accent,
               letterSpacing: '0.12em', marginBottom: 6,
               transition: 'color 0.5s ease',
@@ -463,7 +456,7 @@ export default function Home() {
               {BANNERS[bannerIdx].tag}
             </div>
             <div style={{
-              fontSize: '1.2rem', fontWeight: 700,
+              fontSize: 19, fontWeight: 700,
               color: '#ffffff', marginBottom: 14, lineHeight: 1.35,
               whiteSpace: 'pre-line',
             }}>
@@ -474,7 +467,7 @@ export default function Home() {
               style={{
                 background: BANNERS[bannerIdx].accent, border: 'none',
                 borderRadius: 99, padding: '8px 16px', cursor: 'pointer',
-                fontSize: '0.75rem', fontWeight: 700, color: BANNERS[bannerIdx].bg,
+                fontSize: 12, fontWeight: 700, color: BANNERS[bannerIdx].bg,
                 display: 'inline-flex', alignItems: 'center', gap: 6,
                 transition: 'background 0.5s ease, color 0.5s ease',
               }}
@@ -502,7 +495,7 @@ export default function Home() {
         {/* ── Categories ── */}
         <div style={{ padding: '20px 16px 0' }}>
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14 }}>
-            <div style={{ fontSize: '1rem', fontWeight: 700, color: C.black }}>Categories</div>
+            <div style={{ fontSize: 16, fontWeight: 700, color: C.black }}>Categories</div>
           </div>
           <div style={{ display: 'flex', gap: 10, overflowX: 'auto', paddingBottom: 4, scrollbarWidth: 'none' }}>
             <button
@@ -511,7 +504,7 @@ export default function Home() {
                 flexShrink: 0, padding: '8px 16px', borderRadius: 99,
                 background: !selectedCat ? C.black : C.white,
                 border: `1px solid ${!selectedCat ? C.black : C.border}`,
-                cursor: 'pointer', fontSize: '0.75rem', fontWeight: 600,
+                cursor: 'pointer', fontSize: 12, fontWeight: 600,
                 color: !selectedCat ? C.white : C.black, transition: 'all .15s',
               }}
             >
@@ -528,7 +521,7 @@ export default function Home() {
                     padding: '8px 14px', borderRadius: 99,
                     background: active ? C.black : C.white,
                     border: `1px solid ${active ? C.black : C.border}`,
-                    cursor: 'pointer', fontSize: '0.75rem', fontWeight: 600,
+                    cursor: 'pointer', fontSize: 12, fontWeight: 600,
                     color: active ? C.white : C.black, transition: 'all .15s',
                   }}
                 >
@@ -551,10 +544,10 @@ export default function Home() {
         {!loading && filtered.length === 0 && (
           <div style={{ textAlign: 'center', padding: '60px 20px' }}>
             <ShoppingBag size={40} color={C.border} style={{ margin: '0 auto 16px', display: 'block' }}/>
-            <div style={{ fontSize: '1rem', fontWeight: 600, color: C.black, marginBottom: 6 }}>
+            <div style={{ fontSize: 16, fontWeight: 600, color: C.black, marginBottom: 6 }}>
               {searchQuery ? 'No results found' : 'No products yet'}
             </div>
-            <div style={{ fontSize: '0.8rem', color: C.muted, marginBottom: 20 }}>
+            <div style={{ fontSize: 13, color: C.muted, marginBottom: 20 }}>
               {searchQuery ? 'Try a different search' : 'Be the first seller on Bitsoko'}
             </div>
             {!searchQuery && (
@@ -563,7 +556,7 @@ export default function Home() {
                 style={{
                   background: C.black, border: 'none', borderRadius: 12,
                   padding: '12px 24px', cursor: 'pointer',
-                  fontSize: '0.85rem', fontWeight: 700, color: C.white,
+                  fontSize: 14, fontWeight: 700, color: C.white,
                   display: 'inline-flex', alignItems: 'center', gap: 8,
                 }}
               >
@@ -577,7 +570,7 @@ export default function Home() {
         {!loading && recent.length > 0 && (
           <div style={{ padding: '20px 16px 0' }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14 }}>
-              <div style={{ fontSize: '1rem', fontWeight: 700, color: C.black }}>
+              <div style={{ fontSize: 16, fontWeight: 700, color: C.black }}>
                 {selectedCat ? CATEGORIES.find(c => c.tag === selectedCat)?.label : 'Recent listings'}
               </div>
               <button
@@ -585,7 +578,7 @@ export default function Home() {
                 style={{
                   background: 'none', border: 'none', cursor: 'pointer',
                   display: 'flex', alignItems: 'center', gap: 4,
-                  fontSize: '0.75rem', color: C.ochre, fontWeight: 600,
+                  fontSize: 12, color: C.ochre, fontWeight: 600,
                 }}
               >
                 See all <ChevronRight size={14}/>
@@ -610,7 +603,7 @@ export default function Home() {
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14 }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                 <TrendingUp size={16} color={C.ochre}/>
-                <span style={{ fontSize: '1rem', fontWeight: 700, color: C.black }}>Top sellers</span>
+                <span style={{ fontSize: 16, fontWeight: 700, color: C.black }}>Top sellers</span>
               </div>
             </div>
             <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
@@ -631,13 +624,14 @@ export default function Home() {
                   >
                     <Avatar profile={profile} pubkey={pubkey} size={44}/>
                     <div style={{ flex: 1, minWidth: 0 }}>
-                      <div style={{ fontSize: '0.88rem', fontWeight: 700, color: C.black }}>{name}</div>
+                      <div style={{ fontSize: 14, fontWeight: 700, color: C.black }}>{name}</div>
                       {ln && (
-                        <div style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: '0.68rem', color: C.ochre, marginTop: 2 }}>
-                          <Zap size={10} fill={C.ochre} color={C.ochre}/> {ln}
+                        <div style={{ display: 'flex', alignItems: 'flex-start', gap: 4, fontSize: 11, color: C.ochre, marginTop: 2 }}>
+                          <Zap size={10} fill={C.ochre} color={C.ochre} style={{ flexShrink: 0, marginTop: 1 }}/>
+                          <span style={{ wordBreak: 'break-all', lineHeight: 1.4 }}>{ln}</span>
                         </div>
                       )}
-                      <div style={{ fontSize: '0.68rem', color: C.muted, marginTop: 2 }}>
+                      <div style={{ fontSize: 11, color: C.muted, marginTop: 2 }}>
                         {count} listing{count !== 1 ? 's' : ''}
                       </div>
                     </div>
@@ -664,15 +658,15 @@ export default function Home() {
             <Store size={22} color={C.ochre}/>
           </div>
           <div style={{ flex: 1 }}>
-            <div style={{ fontSize: '0.88rem', fontWeight: 700, color: C.black, marginBottom: 2 }}>Start selling today</div>
-            <div style={{ fontSize: '0.72rem', color: C.muted }}>List products, get paid in sats</div>
+            <div style={{ fontSize: 14, fontWeight: 700, color: C.black, marginBottom: 2 }}>Start selling today</div>
+            <div style={{ fontSize: 11, color: C.muted }}>List products, get paid in sats</div>
           </div>
           <button
             onClick={() => navigate('/create-listing')}
             style={{
               background: C.black, border: 'none', borderRadius: 10,
               padding: '10px 16px', cursor: 'pointer',
-              fontSize: '0.75rem', fontWeight: 700, color: C.white,
+              fontSize: 12, fontWeight: 700, color: C.white,
               display: 'flex', alignItems: 'center', gap: 6, flexShrink: 0,
             }}
           >
@@ -683,6 +677,7 @@ export default function Home() {
       </div>
 
       <style>{`
+        *, *::before, *::after { box-sizing: border-box; }
         @keyframes spin { to { transform: rotate(360deg) } }
         ::-webkit-scrollbar { display: none }
       `}</style>

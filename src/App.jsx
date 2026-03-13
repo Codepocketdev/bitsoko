@@ -15,6 +15,7 @@ import Orders        from './pages/Orders'
 import Messages      from './pages/Messages'
 import Settings      from './pages/Settings'
 import MyShop        from './pages/MyShop'
+import ShopAnalytics from './pages/ShopAnalytics'
 import CreateListing from './pages/CreateListing'
 import ProductDetail from './pages/ProductDetail'
 import PageWrapper   from './components/layout/PageWrapper'
@@ -76,7 +77,8 @@ export default function App() {
               <Route path="/orders"    element={<Orders />} />
               <Route path="/messages"  element={<Messages />} />
               <Route path="/settings"  element={<Settings />} />
-              <Route path="/shop"      element={<MyShop />} />
+              <Route path="/shop"             element={<MyShop />} />
+              <Route path="/shop/analytics"  element={<ShopAnalytics />} />
               <Route path="*"          element={<Navigate to="/" replace />} />
             </Routes>
           </PageWrapper>

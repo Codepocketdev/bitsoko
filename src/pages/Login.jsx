@@ -1,50 +1,47 @@
 import { useState } from 'react'
 import { getPublicKey, nip19 } from 'nostr-tools'
-import { SimplePool } from 'nostr-tools/pool'
 import { Eye, EyeOff, ArrowRight, ArrowLeft } from 'lucide-react'
 import { useNavigate } from 'react-router-dom'
-import { fetchAndSetUserRelays, DEFAULT_RELAYS } from '../lib/nostrSync'
+import { fetchAndSetUserRelays, DEFAULT_RELAYS, getPool } from '../lib/nostrSync'
 import { saveProfile } from '../lib/db'
 
-const FETCH_RELAYS = [
-  'wss://relay.damus.io',
-  'wss://nos.lol',
-  'wss://relay.primal.net',
-  'wss://relay.nostr.band',
-  'wss://nostr-pub.wellorder.net',
-]
-
+// ── fetchAndCacheProfile ──────────────────────
+// FIX: was pool.subscribe() — fire and forget, race condition.
+// Now uses pool.querySync() which awaits ALL relays properly.
+// Profile is saved to IndexedDB AND localStorage BEFORE the
+// second bitsoko_login event fires, so Home.jsx sees the name
+// instantly even after clearing all data.
 async function fetchAndCacheProfile(pubkeyHex) {
   try {
-    const pool = new SimplePool()
-    const sub  = pool.subscribe(
-      FETCH_RELAYS,
-      [{ kinds: [0], authors: [pubkeyHex], limit: 1 }],
-      {
-        async onevent(e) {
-          try {
-            const p = JSON.parse(e.content)
-            await saveProfile(pubkeyHex, p)
-            const name = p.display_name || p.name || ''
-            if (name) localStorage.setItem('bitsoko_display_name', name)
-            if (p.lud16) localStorage.setItem('bitsoko_ln', p.lud16)
-            // Notify same-tab components that fresh profile data is ready
-            window.dispatchEvent(new Event('bitsoko_login'))
-          } catch {}
-          try { sub.close() } catch {}
-        },
-        oneose() { try { sub.close() } catch {} },
-      }
+    const pool   = getPool()
+    const events = await pool.querySync(
+      DEFAULT_RELAYS,
+      { kinds: [0], authors: [pubkeyHex], limit: 1 }
     )
-    setTimeout(() => { try { sub.close() } catch {} }, 10000)
-  } catch {}
+    if (!events.length) return
+
+    events.sort((a, b) => b.created_at - a.created_at)
+    const e = events[0]
+    const p = typeof e.content === 'string' ? JSON.parse(e.content) : e.content
+
+    await saveProfile(pubkeyHex, p)
+
+    const name = p.display_name || p.name || ''
+    if (name) localStorage.setItem('bitsoko_display_name', name)
+    if (p.lud16) localStorage.setItem('bitsoko_ln', p.lud16)
+
+    // Fire AFTER saving — Home.jsx useEffect will pick up the name immediately
+    window.dispatchEvent(new Event('bitsoko_login'))
+  } catch(err) {
+    console.warn('[bitsoko] fetchAndCacheProfile error:', err)
+  }
 }
 
 export default function Login({ onAuth }) {
   const navigate = useNavigate()
-  const [nsec, setNsec] = useState('')
-  const [show, setShow] = useState(false)
-  const [error, setError] = useState('')
+  const [nsec,    setNsec]    = useState('')
+  const [show,    setShow]    = useState(false)
+  const [error,   setError]   = useState('')
   const [loading, setLoading] = useState(false)
 
   const handle = () => {
@@ -57,12 +54,15 @@ export default function Login({ onAuth }) {
       const pk = getPublicKey(sk)
       localStorage.setItem('bitsoko_nsec', nsec.trim())
       localStorage.setItem('bitsoko_npub', nip19.npubEncode(pk))
-      // Dispatch custom event so same-tab components react immediately
-      // (native 'storage' event only fires across tabs, not same tab)
+
+      // First fire — components react immediately (name may be blank still)
       window.dispatchEvent(new Event('bitsoko_login'))
-      // Background: fetch existing Nostr profile and relays
+
+      // Background: querySync saves profile to DB + localStorage,
+      // then fires bitsoko_login again so name appears without refresh
       fetchAndCacheProfile(pk)
       fetchAndSetUserRelays(pk)
+
       onAuth()
     } catch {
       setError('Invalid key — check and try again')
@@ -72,32 +72,26 @@ export default function Login({ onAuth }) {
 
   return (
     <div style={{
-      minHeight: '100vh',
-      background: '#f7f4f0',
+      minHeight: '100vh', background: '#f7f4f0',
       fontFamily: "'Inter', sans-serif",
-      display: 'flex',
-      flexDirection: 'column',
+      display: 'flex', flexDirection: 'column',
     }}>
       <style>{`
         @import url('https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,400;0,600;1,400;1,600&family=Inter:wght@400;500;600&display=swap');
         .bs-input:focus { border-color: #1a1410 !important; outline: none; }
       `}</style>
 
-      {/* Topbar */}
       <div style={{ padding: '16px 20px', display: 'flex', alignItems: 'center' }}>
         <button onClick={() => navigate(-1)} style={{
           display: 'flex', alignItems: 'center', gap: '4px',
           background: 'none', border: 'none', fontSize: '13px',
-          color: '#9c8e80', cursor: 'pointer', fontFamily: "'Inter', sans-serif",
-          padding: '6px 0',
+          color: '#9c8e80', cursor: 'pointer', fontFamily: "'Inter', sans-serif", padding: '6px 0',
         }}>
           <ArrowLeft size={15} /> Back
         </button>
       </div>
 
-      {/* Content */}
       <div style={{ flex: 1, padding: '12px 20px 40px', maxWidth: '480px', width: '100%', margin: '0 auto' }}>
-
         <div style={{ marginBottom: '36px' }}>
           <div style={{
             display: 'inline-flex', alignItems: 'center', gap: '6px',
@@ -109,12 +103,10 @@ export default function Login({ onAuth }) {
             <div style={{ width: '5px', height: '5px', borderRadius: '50%', background: '#f7931a' }} />
             Bitcoin Marketplace
           </div>
-
           <div style={{
             fontFamily: "'Cormorant Garamond', serif",
             fontSize: '42px', fontWeight: '600', fontStyle: 'italic',
-            color: '#1a1410', letterSpacing: '-1px', lineHeight: 1.05,
-            marginBottom: '10px',
+            color: '#1a1410', letterSpacing: '-1px', lineHeight: 1.05, marginBottom: '10px',
           }}>
             Welcome<br />back
           </div>
@@ -136,7 +128,6 @@ export default function Login({ onAuth }) {
           }}>
             Secret Key
           </label>
-
           <div style={{ position: 'relative', marginBottom: error ? '12px' : '16px' }}>
             <input
               className="bs-input"
@@ -161,7 +152,6 @@ export default function Login({ onAuth }) {
               {show ? <EyeOff size={16} /> : <Eye size={16} />}
             </button>
           </div>
-
           {error && (
             <div style={{
               background: 'rgba(181,69,27,0.06)', border: '1px solid rgba(181,69,27,0.15)',
@@ -171,7 +161,6 @@ export default function Login({ onAuth }) {
               {error}
             </div>
           )}
-
           <button onClick={handle} disabled={loading} style={{
             width: '100%', padding: '15px', background: '#1a1410',
             color: '#f7f4f0', border: 'none', borderRadius: '12px',
@@ -203,8 +192,7 @@ export default function Login({ onAuth }) {
 
         <div style={{
           marginTop: '40px', padding: '16px',
-          background: '#ffffff', borderRadius: '14px',
-          border: '1px solid #e8e0d5',
+          background: '#ffffff', borderRadius: '14px', border: '1px solid #e8e0d5',
         }}>
           <div style={{ fontSize: '11px', fontWeight: '600', color: '#1a1410', marginBottom: '4px' }}>
             Your keys, your market

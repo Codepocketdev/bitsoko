@@ -2,11 +2,15 @@ import { useState, useEffect } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import {
   ArrowLeft, Zap, ShieldCheck, Store,
-  Package, Loader, ChevronRight, ExternalLink
+  Package, Loader, ExternalLink
 } from 'lucide-react'
-import { getProfile, getProductsByPubkey, saveProfile } from '../lib/db'
-import { getPool, RELAYS } from '../lib/nostrSync'
+import { getProfile, getProductsByPubkey, saveProfile, saveProduct } from '../lib/db'
+import { getPool, getReadRelays, DEFAULT_RELAYS, KINDS } from '../lib/nostrSync'
 import { nip19 } from 'nostr-tools'
+
+// Pagination: cap DOM images to prevent mobile GPU bitmap eviction
+// (the real cause of the blank-on-scroll bug — same fix Shopstr uses)
+const PAGE_SIZE = 20
 
 const C = {
   bg:     '#f7f4f0',
@@ -55,13 +59,18 @@ function ProductCard({ product, onClick }) {
   return (
     <div onClick={onClick} style={{
       background: C.white, borderRadius: 14,
-      border: `1px solid ${C.border}`, overflow: 'hidden',
-      cursor: 'pointer',
+      border: `1px solid ${C.border}`, overflow: 'hidden', cursor: 'pointer',
     }}>
       <div style={{ aspectRatio: '1', background: C.border, overflow: 'hidden', position: 'relative' }}>
         {image && !imgErr
-          ? <img src={image} alt={product.name} onError={() => setImgErr(true)}
-              style={{ width: '100%', height: '100%', objectFit: 'cover' }}/>
+          ? <img
+              src={image}
+              alt={product.name}
+              onError={() => setImgErr(true)}
+              loading="eager"
+              decoding="async"
+              style={{ width: '100%', height: '100%', objectFit: 'cover', willChange: 'transform' }}
+            />
           : <div style={{ width: '100%', height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
               <Package size={28} color="rgba(26,20,16,0.15)"/>
             </div>
@@ -98,46 +107,95 @@ export default function SellerProfile() {
   const { pubkey } = useParams()
   const navigate   = useNavigate()
 
-  const [profile,  setProfile]  = useState(null)
-  const [products, setProducts] = useState([])
-  const [loading,  setLoading]  = useState(true)
+  const [profile,      setProfile]      = useState(null)
+  const [products,     setProducts]     = useState([])
+  const [loading,      setLoading]      = useState(true)
+  const [visibleCount, setVisibleCount] = useState(PAGE_SIZE)
 
   const myPubkeyHex = (() => {
     try { return nip19.decode(localStorage.getItem('bitsoko_npub')).data } catch { return null }
   })()
   const isMe = pubkey === myPubkeyHex
 
+  // Reset pagination when viewing a different seller
+  useEffect(() => { setVisibleCount(PAGE_SIZE) }, [pubkey])
+
   useEffect(() => {
     let mounted = true
     const load = async () => {
-      // Load profile from IndexedDB first
-      const cached = await getProfile(pubkey)
+      const relays = [...new Set([...getReadRelays(), ...DEFAULT_RELAYS])]
+      const pool   = getPool()
+
+      // ── Step 1: IndexedDB first for both profile + products ──
+      const [cached, cachedProds] = await Promise.all([
+        getProfile(pubkey),
+        getProductsByPubkey(pubkey),
+      ])
+
       if (cached && mounted) setProfile(cached)
 
-      // Load their products from IndexedDB
-      const prods = await getProductsByPubkey(pubkey)
-      if (mounted) {
-        setProducts(prods.filter(p => !p.tags?.some(t => t[0] === 't' && t[1] === 'deleted')))
+      const activeProds = cachedProds.filter(p =>
+        !p.tags?.some(t => t[0] === 't' && t[1] === 'deleted') && p.status !== 'deleted'
+      )
+      if (activeProds.length > 0 && mounted) {
+        setProducts(activeProds)
         setLoading(false)
       }
 
-      // Fetch fresh profile from relay
-      const pool = getPool()
-      const sub  = pool.subscribe(
-        RELAYS,
-        [{ kinds: [0], authors: [pubkey], limit: 1 }],
-        {
-          onevent(e) {
-            try {
-              const p = JSON.parse(e.content)
-              if (mounted) { setProfile(p); saveProfile(pubkey, p) }
-            } catch {}
-          },
-          oneose() { sub.close() },
+      // ── Step 2: Fetch fresh profile from relay (querySync) ──
+      try {
+        const profileEvents = await pool.querySync(
+          relays,
+          { kinds: [0], authors: [pubkey], limit: 1 }
+        )
+        if (profileEvents.length && mounted) {
+          profileEvents.sort((a, b) => b.created_at - a.created_at)
+          const p = JSON.parse(profileEvents[0].content)
+          await saveProfile(pubkey, p)
+          if (mounted) setProfile(p)
         }
-      )
-      setTimeout(() => { try { sub.close() } catch {} }, 6000)
+      } catch(e) {
+        console.warn('[bitsoko] SellerProfile profile fetch error:', e)
+      }
+
+      // ── Step 3: Fetch this seller's products from relay (querySync) ──
+      // This is the fix for: photos disappear on scroll + cleared data empty shop.
+      // We always fetch from relay so the product list is always fresh and complete.
+      try {
+        const productEvents = await pool.querySync(
+          relays,
+          { kinds: [KINDS.LISTING], authors: [pubkey], limit: 200 }
+        )
+
+        if (productEvents.length && mounted) {
+          // Merge: newer created_at wins for same pubkey:d-tag
+          const mergedMap = new Map()
+          for (const event of productEvents) {
+            const dTag = (event.tags || []).find(t => t[0] === 'd')?.[1]
+            const key  = dTag ? `${event.pubkey}:${dTag}` : event.id
+            const ex   = mergedMap.get(key)
+            if (!ex || event.created_at >= ex.created_at) mergedMap.set(key, event)
+          }
+
+          // Save all to IndexedDB
+          for (const event of mergedMap.values()) {
+            await saveProduct(event)
+          }
+
+          // Reload from IndexedDB (normalised, parsed)
+          const fresh = await getProductsByPubkey(pubkey)
+          const active = fresh.filter(p =>
+            !p.tags?.some(t => t[0] === 't' && t[1] === 'deleted') && p.status !== 'deleted'
+          )
+          if (mounted) setProducts(active)
+        }
+      } catch(e) {
+        console.warn('[bitsoko] SellerProfile products fetch error:', e)
+      }
+
+      if (mounted) setLoading(false)
     }
+
     load()
     return () => { mounted = false }
   }, [pubkey])
@@ -164,7 +222,6 @@ export default function SellerProfile() {
         }}>
           <ArrowLeft size={17} color={C.black}/>
         </button>
-        {/* If viewing your own store, show Edit button */}
         {isMe && (
           <button onClick={() => navigate('/profile')} style={{
             padding: '8px 16px', borderRadius: 99,
@@ -176,9 +233,12 @@ export default function SellerProfile() {
         )}
       </div>
 
-      {/* Hero / profile card */}
+      {/* Hero card — curvy, not edge-to-edge */}
       <div style={{
-        background: C.black, padding: '28px 20px 24px',
+        background: C.black,
+        margin: '0 16px',
+        borderRadius: 24,
+        padding: '28px 20px 24px',
         display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 12,
       }}>
         <Avatar profile={profile} pubkey={pubkey} size={80}/>
@@ -197,16 +257,20 @@ export default function SellerProfile() {
           )}
         </div>
 
-        {/* Badges row */}
+        {/* Badges */}
         <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', justifyContent: 'center' }}>
           {profile?.lud16 && (
             <div style={{
-              display: 'flex', alignItems: 'center', gap: 5,
-              background: 'rgba(247,147,26,0.15)', borderRadius: 99,
-              padding: '5px 12px', border: '1px solid rgba(247,147,26,0.25)',
+              display: 'inline-flex', alignItems: 'center', gap: 5,
+              background: 'rgba(247,147,26,0.18)', borderRadius: 99,
+              padding: '6px 14px', border: '1px solid rgba(247,147,26,0.3)',
+              maxWidth: 240,
             }}>
-              <Zap size={11} fill={C.orange} color={C.orange}/>
-              <span style={{ fontSize: '0.7rem', color: C.orange, fontWeight: 600 }}>
+              <Zap size={11} fill={C.orange} color={C.orange} style={{ flexShrink: 0 }}/>
+              <span style={{
+                fontSize: 11, color: C.orange, fontWeight: 600,
+                overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+              }}>
                 {profile.lud16}
               </span>
             </div>
@@ -238,7 +302,6 @@ export default function SellerProfile() {
           )}
         </div>
 
-        {/* npub */}
         <div style={{ fontSize: '0.62rem', color: 'rgba(255,255,255,0.3)', fontFamily: 'monospace' }}>
           {npubShort}
         </div>
@@ -247,7 +310,7 @@ export default function SellerProfile() {
       {/* Stats bar */}
       <div style={{
         background: C.white, borderBottom: `1px solid ${C.border}`,
-        padding: '14px 20px',
+        padding: '14px 20px', marginTop: 16,
         display: 'flex', alignItems: 'center', gap: 6,
       }}>
         <Store size={14} color={C.ochre}/>
@@ -272,7 +335,7 @@ export default function SellerProfile() {
             <Package size={40} color={C.border}/>
             <div style={{ fontSize: '0.9rem', fontWeight: 700, color: C.black }}>No listings yet</div>
             <div style={{ fontSize: '0.75rem', color: C.muted }}>
-              {isMe ? 'Add your first product' : 'This seller hasn\'t listed anything yet'}
+              {isMe ? 'Add your first product' : "This seller hasn't listed anything yet"}
             </div>
             {isMe && (
               <button onClick={() => navigate('/create-listing')} style={{
@@ -287,15 +350,29 @@ export default function SellerProfile() {
         )}
 
         {!loading && products.length > 0 && (
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
-            {products.map(p => (
-              <ProductCard
-                key={p.id}
-                product={p}
-                onClick={() => navigate(`/product/${p.id}`)}
-              />
-            ))}
-          </div>
+          <>
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+              {products.slice(0, visibleCount).map(p => (
+                <ProductCard key={p.id} product={p} onClick={() => navigate(`/product/${p.id}`)}/>
+              ))}
+            </div>
+
+            {/* Load more — keeps DOM image count low, prevents GPU bitmap eviction */}
+            {visibleCount < products.length && (
+              <button
+                onClick={() => setVisibleCount(c => c + PAGE_SIZE)}
+                style={{
+                  width: '100%', marginTop: 16, padding: '13px',
+                  background: C.white, border: `1.5px solid ${C.border}`,
+                  borderRadius: 14, cursor: 'pointer',
+                  fontSize: '0.82rem', fontWeight: 600, color: C.black,
+                  fontFamily: "'Inter',sans-serif",
+                }}
+              >
+                Load more · {products.length - visibleCount} remaining
+              </button>
+            )}
+          </>
         )}
       </div>
 
