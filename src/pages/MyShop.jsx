@@ -88,6 +88,7 @@ function EditSheet({ product, onSave, onCancel }) {
   const [shipping,  setShipping]  = useState(product.shipping || [])
   const [uploading, setUploading] = useState(false)
   const [saving,    setSaving]    = useState(false)
+  const [saved,     setSaved]     = useState(false)
   const [errMsg,    setErrMsg]    = useState('')
   const [activeTab, setActiveTab] = useState('details')
 
@@ -99,8 +100,10 @@ function EditSheet({ product, onSave, onCancel }) {
     setUploading(true); setErrMsg('')
     for (const file of arr) {
       if (!file.type.startsWith('image/')) continue
-      try { const url = await uploadImage(file); setImages(prev => [...prev, url]) }
-      catch { setErrMsg('Image upload failed') }
+      try {
+          const url = await uploadImage(file)
+          setImages(prev => [...prev, url])
+        } catch { setErrMsg('Image upload failed') }
     }
     setUploading(false)
   }
@@ -115,7 +118,11 @@ function EditSheet({ product, onSave, onCancel }) {
   const handleSave = async () => {
     if (!name.trim()) { setErrMsg('Name is required'); return }
     setSaving(true); setErrMsg('')
-    try { await onSave({ images, name, description, price:parseInt(price), quantity, categories, shipping }) }
+    try {
+      await onSave({ images, name, description, price:parseInt(price), quantity, categories, shipping })
+      setSaved(true)
+      setTimeout(() => onCancel(), 1200) // auto-close after showing success
+    }
     catch (e) { setErrMsg(e.message||'Save failed'); setSaving(false) }
   }
 
@@ -137,13 +144,20 @@ function EditSheet({ product, onSave, onCancel }) {
         <div style={{ padding:'16px 20px 0',flexShrink:0 }}>
           <div style={{ width:36,height:4,borderRadius:2,background:C.border,margin:'0 auto 16px' }}/>
           <div style={{ display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:16 }}>
-            <div style={{ fontSize:'1rem',fontWeight:700,color:C.black }}>Edit listing</div>
-            <button onClick={handleSave} disabled={saving} style={{
-              padding:'8px 18px',borderRadius:99,background:C.black,border:'none',
-              cursor:saving?'not-allowed':'pointer',fontSize:'0.78rem',fontWeight:700,color:C.white,
+            <div style={{ display:'flex',alignItems:'center',gap:10 }}>
+              <button onClick={onCancel} style={{ width:32,height:32,borderRadius:'50%',background:C.bg,border:`1px solid ${C.border}`,display:'flex',alignItems:'center',justifyContent:'center',cursor:'pointer',flexShrink:0 }}>
+                <X size={15} color={C.muted}/>
+              </button>
+              <div style={{ fontSize:'1rem',fontWeight:700,color:C.black }}>Edit listing</div>
+            </div>
+            <button onClick={handleSave} disabled={saving||saved} style={{
+              padding:'8px 18px',borderRadius:99,
+              background:saved?C.muted:C.black,border:'none',
+              cursor:saving||saved?'not-allowed':'pointer',fontSize:'0.78rem',fontWeight:700,color:C.white,
               display:'flex',alignItems:'center',gap:6,
+              transition:'background 0.2s',
             }}>
-              {saving ? <><Loader size={13} style={{animation:'spin 1s linear infinite'}}/> Saving…</> : 'Save changes'}
+              {saving ? <><Loader size={13} style={{animation:'spin 1s linear infinite'}}/> Saving…</> : saved ? <><Check size={13}/> Saved!</> : 'Save changes'}
             </button>
           </div>
           <div style={{ display:'flex',gap:4,background:C.bg,borderRadius:12,padding:4,marginBottom:4 }}>
@@ -421,7 +435,7 @@ export default function MyShop() {
       {/* Header */}
       <div style={{ background:C.white,borderBottom:`1px solid ${C.border}`,padding:'16px 20px',display:'flex',alignItems:'center',justifyContent:'space-between',position:'sticky',top:0,zIndex:50 }}>
         <div style={{ display:'flex',alignItems:'center',gap:14 }}>
-          <button onClick={()=>navigate(-1)} style={{ width:36,height:36,borderRadius:'50%',background:C.bg,border:`1px solid ${C.border}`,display:'flex',alignItems:'center',justifyContent:'center',cursor:'pointer' }}>
+          <button onClick={()=>navigate('/', { state: { openMore: true } })} style={{ width:36,height:36,borderRadius:'50%',background:C.bg,border:`1px solid ${C.border}`,display:'flex',alignItems:'center',justifyContent:'center',cursor:'pointer' }}>
             <ArrowLeft size={17} color={C.black}/>
           </button>
           <div>

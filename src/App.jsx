@@ -1,5 +1,5 @@
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
-import { useState } from 'react'
+import { useState, lazy, Suspense } from 'react'
 import './styles/index.css'
 
 import Landing       from './pages/Landing'
@@ -20,14 +20,12 @@ import CreateListing from './pages/CreateListing'
 import ProductDetail from './pages/ProductDetail'
 import PageWrapper   from './components/layout/PageWrapper'
 
-// ── Auth check is SYNCHRONOUS ─────────────────
-// Read localStorage before first render so React
-// never mounts the wrong route tree at all.
-// No useEffect, no flash, no landing page blink.
+// Lazy load Wallet so cashu-ts issues never crash the whole app
+const Wallet = lazy(() => import('./pages/Wallet'))
+
 const isLoggedIn = () => !!localStorage.getItem('bitsoko_nsec')
 
 export default function App() {
-  // Lazy initializer runs once synchronously — no useEffect needed
   const [authed, setAuthed] = useState(isLoggedIn)
   const [theme,  setTheme]  = useState(() => {
     const saved = localStorage.getItem('bitsoko_theme') || 'light'
@@ -48,10 +46,10 @@ export default function App() {
     return (
       <BrowserRouter>
         <Routes>
-          <Route path="/"       element={<Landing />} />
-          <Route path="/login"  element={<Login onAuth={handleAuth} />} />
-          <Route path="/create" element={<CreateAccount onAuth={handleAuth} />} />
-          <Route path="*"       element={<Navigate to="/" replace />} />
+          <Route path="/"       element={<Landing />}/>
+          <Route path="/login"  element={<Login onAuth={handleAuth}/>}/>
+          <Route path="/create" element={<CreateAccount onAuth={handleAuth}/>}/>
+          <Route path="*"       element={<Navigate to="/" replace/>}/>
         </Routes>
       </BrowserRouter>
     )
@@ -60,26 +58,30 @@ export default function App() {
   return (
     <BrowserRouter>
       <Routes>
-        {/* Full-screen pages — no BottomNav */}
-        <Route path="/create-listing" element={<CreateListing />} />
-        <Route path="/product/:id"    element={<ProductDetail />} />
-        <Route path="/profile"        element={<Profile />} />
-        <Route path="/seller/:pubkey" element={<SellerProfile />} />
+        {/* Full-screen pages — no BottomNav, no PageWrapper teardown on nav */}
+        <Route path="/create-listing"   element={<CreateListing />}/>
+        <Route path="/product/:id"      element={<ProductDetail />}/>
+        <Route path="/seller/:pubkey"   element={<SellerProfile />}/>
+        <Route path="/wallet"          element={<Suspense fallback={<div style={{minHeight:'100vh',background:'#1a1410'}}/>}><Wallet /></Suspense>}/>
 
-        {/* App shell — all other pages get BottomNav */}
+        {/* App shell — PageWrapper stays mounted across ALL these routes.
+            FIX: Profile was outside PageWrapper before, causing a full
+            component-tree teardown on every navigate from More sheet → Profile.
+            Now it's inside, navigation is just a child swap — instant. */}
         <Route path="*" element={
           <PageWrapper toggleTheme={toggleTheme} theme={theme}>
             <Routes>
-              <Route path="/"          element={<Home />} />
-              <Route path="/explore"   element={<Explore />} />
-              <Route path="/deals"     element={<Deals />} />
-              <Route path="/cart"      element={<Cart />} />
-              <Route path="/orders"    element={<Orders />} />
-              <Route path="/messages"  element={<Messages />} />
-              <Route path="/settings"  element={<Settings />} />
-              <Route path="/shop"             element={<MyShop />} />
-              <Route path="/shop/analytics"  element={<ShopAnalytics />} />
-              <Route path="*"          element={<Navigate to="/" replace />} />
+              <Route path="/"                element={<Home />}/>
+              <Route path="/explore"         element={<Explore />}/>
+              <Route path="/deals"           element={<Deals />}/>
+              <Route path="/cart"            element={<Cart />}/>
+              <Route path="/profile"         element={<Profile />}/>
+              <Route path="/orders"          element={<Orders />}/>
+              <Route path="/messages"        element={<Messages />}/>
+              <Route path="/settings"        element={<Settings />}/>
+              <Route path="/shop"            element={<MyShop />}/>
+              <Route path="/shop/analytics"  element={<ShopAnalytics />}/>
+              <Route path="*"               element={<Navigate to="/" replace/>}/>
             </Routes>
           </PageWrapper>
         }/>

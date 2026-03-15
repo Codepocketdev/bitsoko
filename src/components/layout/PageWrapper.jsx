@@ -3,7 +3,7 @@ import { useLocation, useNavigate } from 'react-router-dom'
 import {
   Home, Search, Tag, ShoppingCart, Menu,
   User, Store, Package, MessageCircle,
-  Settings, LogOut, X, Zap, ChevronRight
+  Settings, X, Zap, ChevronRight
 } from 'lucide-react'
 
 const NAV_ITEMS = [
@@ -21,6 +21,7 @@ const MORE_ITEMS = [
       { path: '/shop',     icon: Store,        label: 'My Shop',  sub: 'Manage your listings'      },
       { path: '/orders',   icon: Package,      label: 'Orders',   sub: 'Purchases & sales'         },
       { path: '/messages', icon: MessageCircle,label: 'Messages', sub: 'DMs with buyers & sellers' },
+      { path: '/wallet',   icon: Zap,           label: 'Wallet',   sub: 'Cashu • Lightning payments'  },
     ]
   },
   {
@@ -68,15 +69,6 @@ function MoreSheet({ onClose, navigate, currentPath }) {
   // FIX: navigate directly — PageWrapper closes sheet via location useEffect
   // Old: navigate(path) + onClose() caused re-render flash through home
   const handleNav = (path) => navigate(path)
-
-  const handleLogout = () => {
-    localStorage.removeItem('bitsoko_nsec')
-    localStorage.removeItem('bitsoko_npub')
-    localStorage.removeItem('bitsoko_display_name')
-    localStorage.removeItem('bitsoko_ln')
-    onClose()
-    window.location.href = '/'
-  }
 
   return (
     <>
@@ -146,17 +138,6 @@ function MoreSheet({ onClose, navigate, currentPath }) {
           </div>
         ))}
 
-        {/* Log out */}
-        <button onClick={handleLogout} style={{ width: '100%', display: 'flex', alignItems: 'center', gap: 14, padding: '13px 20px', background: 'none', border: 'none', borderLeft: '3px solid transparent', cursor: 'pointer', textAlign: 'left' }}>
-          <div style={{ width: 40, height: 40, borderRadius: 12, background: 'rgba(181,69,27,0.06)', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
-            <LogOut size={18} color={C.terra} strokeWidth={1.8}/>
-          </div>
-          <div style={{ flex: 1 }}>
-            <div style={{ fontSize: 14, fontWeight: 500, color: C.terra }}>Log Out</div>
-            <div style={{ fontSize: 11, color: C.muted, marginTop: 1 }}>Keys stay on your device</div>
-          </div>
-        </button>
-
         <div style={{ height: 12 }}/>
       </div>
     </>
@@ -167,7 +148,7 @@ function BottomNav({ onMorePress }) {
   const location   = useLocation()
   const navigate   = useNavigate()
   const current    = location.pathname
-  const moreActive = ['/profile','/shop','/orders','/messages','/settings'].includes(current)
+  const moreActive = ['/profile','/shop','/orders','/messages','/settings','/wallet'].includes(current)
 
   return (
     <nav style={{

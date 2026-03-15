@@ -1,6 +1,6 @@
 // src/hooks/useNostrProfile.js
 // ─────────────────────────────────────────────
-// GradeBase-pattern hook for fetching Nostr profiles.
+// Bitsoko-pattern hook for fetching Nostr profiles.
 // 1. Returns cached IndexedDB data immediately (zero flash)
 // 2. Fetches fresh data from relays in background
 // 3. Saves fresh data to IndexedDB for next login

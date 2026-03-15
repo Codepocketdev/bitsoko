@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import { useNavigate } from 'react-router-dom'
 import {
   Search, Bell, Zap, ChevronRight, Store,
@@ -10,35 +10,36 @@ import { openDB, getProducts, getProfile, getProfiles } from '../lib/db'
 import { fetchAndSeed, startSync, stopSync, getPublicKeyHex } from '../lib/nostrSync'
 import { useNostrProfile } from '../hooks/useNostrProfile'
 
-// ── Design tokens ─────────────────────────────
 const C = {
-  bg:      '#f7f4f0',
-  white:   '#ffffff',
-  black:   '#1a1410',
-  muted:   '#b0a496',
-  border:  '#e8e0d5',
-  orange:  '#f7931a',
-  ochre:   '#c8860a',
-  terra:   '#b5451b',
-  sage:    '#2d6a4f',
+  bg:     '#f7f4f0',
+  white:  '#ffffff',
+  black:  '#1a1410',
+  muted:  '#b0a496',
+  border: '#e8e0d5',
+  orange: '#f7931a',
+  ochre:  '#c8860a',
+  terra:  '#b5451b',
+  sage:   '#2d6a4f',
 }
 
-// ── Categories ────────────────────────────────
+// FIX: tag values now match p.categories exactly (full names from db.js saveProduct)
+// Old tags were lowercase short ('electronics', 'food') — never matched p.categories
 const CATEGORIES = [
-  { icon: Smartphone, label: 'Electronics', tag: 'electronics' },
-  { icon: Shirt,      label: 'Fashion',     tag: 'fashion'     },
-  { icon: Coffee,     label: 'Food',        tag: 'food'        },
-  { icon: Palette,    label: 'Art',         tag: 'art'         },
-  { icon: HomeIcon,   label: 'Home',        tag: 'home'        },
-  { icon: BookOpen,   label: 'Books',       tag: 'books'       },
-  { icon: Music,      label: 'Music',       tag: 'music'       },
-  { icon: Leaf,       label: 'Wellness',    tag: 'wellness'    },
+  { icon: Smartphone, label: 'Electronics',  tag: 'Electronics'   },
+  { icon: Shirt,      label: 'Fashion',      tag: 'Fashion'       },
+  { icon: Coffee,     label: 'Food',         tag: 'Food & Drinks' },
+  { icon: Palette,    label: 'Art',          tag: 'Art & Crafts'  },
+  { icon: HomeIcon,   label: 'Home',         tag: 'Home & Living' },
+  { icon: BookOpen,   label: 'Books',        tag: 'Books'         },
+  { icon: Music,      label: 'Music',        tag: 'Music'         },
+  { icon: Leaf,       label: 'Wellness',     tag: 'Wellness'      },
 ]
 
-// ── Helpers ───────────────────────────────────
+const PAGE_SIZE   = 20
+const DEBOUNCE_MS = 300
+
 function satsToKsh(sats) {
-  const btcKsh = 13_000_000
-  const ksh = (sats / 100_000_000) * btcKsh
+  const ksh = (sats / 100_000_000) * 13_000_000
   if (ksh >= 1000) return `KSh ${(ksh / 1000).toFixed(1)}k`
   return `KSh ${Math.round(ksh)}`
 }
@@ -50,23 +51,14 @@ function timeAgo(ts) {
   return `${Math.floor(s / 86400)}d ago`
 }
 
-// ── Avatar ────────────────────────────────────
 function Avatar({ profile, pubkey, size = 36 }) {
   const [err, setErr] = useState(false)
   const name   = profile?.name || profile?.display_name || pubkey?.slice(0, 4) || '?'
   const letter = name[0].toUpperCase()
-
   if (profile?.picture && !err) {
     return (
-      <img
-        src={profile.picture} alt={letter}
-        onError={() => setErr(true)}
-        style={{
-          width: size, height: size, borderRadius: '50%',
-          objectFit: 'cover', flexShrink: 0,
-          border: `1.5px solid ${C.border}`,
-        }}
-      />
+      <img src={profile.picture} alt={letter} onError={() => setErr(true)}
+        style={{ width: size, height: size, borderRadius: '50%', objectFit: 'cover', flexShrink: 0, border: `1.5px solid ${C.border}` }}/>
     )
   }
   return (
@@ -82,47 +74,30 @@ function Avatar({ profile, pubkey, size = 36 }) {
   )
 }
 
-// ── Product Card ──────────────────────────────
 function ProductCard({ product, profile, onClick }) {
   const image      = product.images?.[0]
-  const hasImage   = !!image
   const name       = product.name  || 'Untitled'
   const price      = product.price || 0
   const sellerName = profile?.name || profile?.display_name || product.pubkey?.slice(0, 8) + '…'
+  const [imgErr,   setImgErr] = useState(false)
 
   return (
-    <div
-      onClick={onClick}
-      style={{
-        background: C.white, borderRadius: 16,
-        border: `1px solid ${C.border}`, overflow: 'hidden',
-        cursor: 'pointer', transition: 'transform 0.18s, box-shadow 0.18s',
-        boxShadow: '0 2px 8px rgba(26,20,16,0.04)',
-      }}
-      onMouseEnter={e => {
-        e.currentTarget.style.transform = 'translateY(-2px)'
-        e.currentTarget.style.boxShadow = '0 6px 20px rgba(26,20,16,0.10)'
-      }}
-      onMouseLeave={e => {
-        e.currentTarget.style.transform = 'translateY(0)'
-        e.currentTarget.style.boxShadow = '0 2px 8px rgba(26,20,16,0.04)'
-      }}
-    >
-      <div style={{
-        width: '100%', aspectRatio: '1',
-        background: C.bg, position: 'relative', overflow: 'hidden',
-      }}>
-        {hasImage ? (
+    <div onClick={onClick} style={{
+      background: C.white, borderRadius: 16,
+      border: `1px solid ${C.border}`, overflow: 'hidden',
+      cursor: 'pointer',
+      boxShadow: '0 2px 8px rgba(26,20,16,0.04)',
+    }}>
+      <div style={{ width: '100%', aspectRatio: '1', background: C.bg, position: 'relative', overflow: 'hidden' }}>
+        {image && !imgErr ? (
           <img
-            src={image} alt={name} loading="lazy"
-            style={{ width: '100%', height: '100%', objectFit: 'cover' }}
-            onError={e => { e.target.style.display = 'none' }}
+            src={image} alt={name}
+            onError={() => setImgErr(true)}
+            loading="eager" decoding="async"
+            style={{ width: '100%', height: '100%', objectFit: 'cover', willChange: 'transform' }}
           />
         ) : (
-          <div style={{
-            width: '100%', height: '100%',
-            display: 'flex', alignItems: 'center', justifyContent: 'center',
-          }}>
+          <div style={{ width: '100%', height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
             <Store size={28} color="rgba(26,20,16,0.12)"/>
           </div>
         )}
@@ -133,22 +108,13 @@ function ProductCard({ product, profile, onClick }) {
           display: 'flex', alignItems: 'center', gap: 4,
         }}>
           <Zap size={10} fill={C.orange} color={C.orange}/>
-          <span style={{
-            fontFamily: "'Inter',sans-serif",
-            fontSize: 10, fontWeight: 700, color: C.white,
-          }}>
+          <span style={{ fontFamily: "'Inter',sans-serif", fontSize: 10, fontWeight: 700, color: C.white }}>
             {price.toLocaleString()} sats
           </span>
         </div>
       </div>
-
       <div style={{ padding: '10px 12px 12px' }}>
-        <div style={{
-          fontFamily: "'Inter',sans-serif",
-          fontSize: 13, fontWeight: 600,
-          color: C.black, marginBottom: 2,
-          overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
-        }}>
+        <div style={{ fontFamily: "'Inter',sans-serif", fontSize: 13, fontWeight: 600, color: C.black, marginBottom: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
           {name}
         </div>
         <div style={{ fontFamily: "'Inter',sans-serif", fontSize: 11, color: C.muted, marginBottom: 6 }}>
@@ -156,11 +122,7 @@ function ProductCard({ product, profile, onClick }) {
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
           <Avatar profile={profile} pubkey={product.pubkey} size={16}/>
-          <span style={{
-            fontFamily: "'Inter',sans-serif",
-            fontSize: 10, color: C.muted,
-            overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
-          }}>
+          <span style={{ fontFamily: "'Inter',sans-serif", fontSize: 10, color: C.muted, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
             {sellerName}
           </span>
         </div>
@@ -169,17 +131,19 @@ function ProductCard({ product, profile, onClick }) {
   )
 }
 
-// ── Main ──────────────────────────────────────
 export default function Home() {
   const navigate = useNavigate()
 
-  const [products,    setProducts]    = useState([])
-  const [profiles,    setProfiles]    = useState({})
-  const [loading,     setLoading]     = useState(true)
-  const [syncing,     setSyncing]     = useState(false)
-  const [newCount,    setNewCount]    = useState(0)
-  const [selectedCat, setSelectedCat] = useState(null)
-  const [searchQuery, setSearchQuery] = useState('')
+  const [products,     setProducts]     = useState([])
+  const [profiles,     setProfiles]     = useState({})
+  const [loading,      setLoading]      = useState(true)
+  const [syncing,      setSyncing]      = useState(false)
+  const [newCount,     setNewCount]     = useState(0)
+  const [selectedCat,  setSelectedCat]  = useState(null)
+  const [searchQuery,  setSearchQuery]  = useState('')
+  const [visibleCount, setVisibleCount] = useState(PAGE_SIZE)
+
+  const debounceTimer = useRef(null)
 
   const _pubkeyHex = (() => { try { return getPublicKeyHex() } catch { return '' } })()
   const { profile: _userProfile } = useNostrProfile(_pubkeyHex)
@@ -208,65 +172,41 @@ export default function Home() {
     return () => window.removeEventListener('bitsoko_login', onLogin)
   }, [])
 
-  // ── Cycling banner ────────────────────────
+  // Reset pagination when filter/search changes
+  useEffect(() => { setVisibleCount(PAGE_SIZE) }, [selectedCat, searchQuery])
+
+  // ── Debounced DB reload ───────────────────
+  const debouncedReload = useCallback(async () => {
+    if (debounceTimer.current) clearTimeout(debounceTimer.current)
+    debounceTimer.current = setTimeout(async () => {
+      const updated = await getProducts(500)
+      setProducts(updated)
+      const pubkeys = [...new Set(updated.map(p => p.pubkey).filter(Boolean))]
+      const profs   = await getProfiles(pubkeys)
+      const profMap = {}
+      profs.forEach((pr, i) => { if (pr) profMap[pubkeys[i]] = pr })
+      setProfiles(profMap)
+    }, DEBOUNCE_MS)
+  }, [])
+
+  // ── Banners ───────────────────────────────
   const BANNERS = [
-    {
-      bg:     '#e8614a',
-      accent: '#fdf0e8',
-      tag:    'LIGHTNING DEALS',
-      title:  'Pay with sats,\npay in seconds',
-      cta:    'Browse deals',
-      path:   '/deals',
-      bubble: 'rgba(253,240,232,0.15)',
-    },
-    {
-      bg:     '#f5a623',
-      accent: '#1a1410',
-      tag:    'BITCOIN PAYMENTS',
-      title:  'Your storefront.\nOn Bitcoin rails.',
-      cta:    'Start selling',
-      path:   '/create-listing',
-      bubble: 'rgba(26,20,16,0.08)',
-    },
-    {
-      bg:     '#4a7fc1',
-      accent: '#fdf0e8',
-      tag:    'LOCAL SELLERS',
-      title:  'Fresh finds from\nyour community',
-      cta:    'Explore now',
-      path:   '/explore',
-      bubble: 'rgba(253,240,232,0.12)',
-    },
-    {
-      bg:     '#4ab8a0',
-      accent: '#fdf0e8',
-      tag:    'NEW ARRIVALS',
-      title:  'Just listed\nthis week',
-      cta:    'See listings',
-      path:   '/explore',
-      bubble: 'rgba(253,240,232,0.12)',
-    },
-    {
-      bg:     '#e85d3a',
-      accent: '#f5a623',
-      tag:    'START SELLING',
-      title:  'List your product,\nearn in sats',
-      cta:    'List now',
-      path:   '/create-listing',
-      bubble: 'rgba(245,166,35,0.12)',
-    },
+    { bg: '#e8614a', accent: '#fdf0e8', tag: 'LIGHTNING DEALS',   title: 'Pay with sats,\npay in seconds',       cta: 'Browse deals',  path: '/deals',          bubble: 'rgba(253,240,232,0.15)' },
+    { bg: '#f5a623', accent: '#1a1410', tag: 'BITCOIN PAYMENTS',  title: 'Your storefront.\nOn Bitcoin rails.',   cta: 'Start selling', path: '/create-listing', bubble: 'rgba(26,20,16,0.08)'   },
+    { bg: '#4a7fc1', accent: '#fdf0e8', tag: 'LOCAL SELLERS',     title: 'Fresh finds from\nyour community',     cta: 'Explore now',   path: '/explore',        bubble: 'rgba(253,240,232,0.12)' },
+    { bg: '#4ab8a0', accent: '#fdf0e8', tag: 'NEW ARRIVALS',      title: 'Just listed\nthis week',               cta: 'See listings',  path: '/explore',        bubble: 'rgba(253,240,232,0.12)' },
+    { bg: '#e85d3a', accent: '#f5a623', tag: 'START SELLING',     title: 'List your product,\nearn in sats',     cta: 'List now',      path: '/create-listing', bubble: 'rgba(245,166,35,0.12)' },
   ]
   const [bannerIdx, setBannerIdx] = useState(0)
-
   useEffect(() => {
     const t = setInterval(() => setBannerIdx(i => (i + 1) % BANNERS.length), 4000)
     return () => clearInterval(t)
   }, [])
 
-  // ── Load from IndexedDB first ──
+  // ── Load from IndexedDB first ─────────────
   const loadFromDB = useCallback(async () => {
     await openDB()
-    const saved = await getProducts(100)
+    const saved = await getProducts(500)
     if (saved.length > 0) {
       setProducts(saved)
       setLoading(false)
@@ -278,28 +218,21 @@ export default function Home() {
     }
   }, [])
 
-  // ── Seed from relays then start live sync ──
+  // ── Seed + live sync ──────────────────────
   useEffect(() => {
     let mounted = true
 
     const init = async () => {
       await loadFromDB()
-
       setSyncing(true)
+
       await fetchAndSeed({
-        onProduct: async (event) => {
-          if (!mounted) return
-          const updated = await getProducts(100)
-          setProducts(updated)
-          const prof = await getProfile(event.pubkey)
-          if (prof) setProfiles(prev => ({ ...prev, [event.pubkey]: prof }))
-        },
+        // FIX: debounced — was calling getProducts on every event, dozens per second during seed
+        onProduct: () => { if (mounted) debouncedReload() },
         onProfile: (event) => {
           if (!mounted) return
           try {
-            const p = typeof event.content === 'string'
-              ? JSON.parse(event.content)
-              : event.content
+            const p = typeof event.content === 'string' ? JSON.parse(event.content) : event.content
             setProfiles(prev => ({ ...prev, [event.pubkey]: p }))
           } catch {}
         },
@@ -307,28 +240,36 @@ export default function Home() {
           if (!mounted) return
           setSyncing(false)
           setLoading(false)
+          getProducts(500).then(all => { if (mounted) setProducts(all) })
         },
       })
 
       startSync({
+        // FIX: direct state update — no DB round-trip on every live event
         onProduct: async (event) => {
           if (!mounted) return
           if (event._deleted) {
-            setProducts(prev => prev.filter(p => p.id !== event.id))
+            setProducts(prev => prev.filter(p => p.id !== event.id && p.event_id !== event.id))
             return
           }
-          const updated = await getProducts(100)
-          setProducts(updated)
+          setProducts(prev => {
+            const idx = prev.findIndex(p => p.id === event.id)
+            if (idx >= 0) {
+              if (event.created_at >= prev[idx].created_at) {
+                const next = [...prev]; next[idx] = event; return next
+              }
+              return prev
+            }
+            return [event, ...prev]
+          })
           setNewCount(n => n + 1)
           const prof = await getProfile(event.pubkey)
-          if (prof) setProfiles(prev => ({ ...prev, [event.pubkey]: prof }))
+          if (prof && mounted) setProfiles(prev => ({ ...prev, [event.pubkey]: prof }))
         },
         onProfile: (event) => {
           if (!mounted) return
           try {
-            const p = typeof event.content === 'string'
-              ? JSON.parse(event.content)
-              : event.content
+            const p = typeof event.content === 'string' ? JSON.parse(event.content) : event.content
             setProfiles(prev => ({ ...prev, [event.pubkey]: p }))
           } catch {}
         },
@@ -338,36 +279,39 @@ export default function Home() {
     init()
     return () => {
       mounted = false
+      if (debounceTimer.current) clearTimeout(debounceTimer.current)
       stopSync()
     }
   }, [])
 
   // ── Filter ────────────────────────────────
+  // FIX: was using raw p.tags array — now uses p.categories (parsed by db.js saveProduct)
   const filtered = products.filter(p => {
-    if (p.deleted) return false
-    const tags = (p.tags || []).map(t => t[1] || '')
-    if (selectedCat && !tags.includes(selectedCat)) return false
+    if (p.deleted || p.status === 'deleted') return false
+    const tTags = (p.tags || []).filter(t => t[0] === 't').map(t => t[1] || '')
+    if (tTags.includes('deleted')) return false
+    // p.categories = already-parsed category names (e.g. 'Electronics', 'Food & Drinks')
+    if (selectedCat && !(p.categories || []).includes(selectedCat)) return false
     if (searchQuery) {
       const q = searchQuery.toLowerCase()
-      return (
-        p.name?.toLowerCase().includes(q) ||
-        p.description?.toLowerCase().includes(q)
-      )
+      return p.name?.toLowerCase().includes(q) || p.description?.toLowerCase().includes(q)
     }
     return true
   })
 
-  const recent = filtered.slice(0, 6)
+  const sorted   = [...filtered].sort((a, b) => b.created_at - a.created_at)
+  const visible  = sorted.slice(0, visibleCount)
+
   const topSellers = Object.values(
     products.reduce((acc, p) => {
       if (!acc[p.pubkey]) acc[p.pubkey] = { pubkey: p.pubkey, count: 0 }
       acc[p.pubkey].count++
       return acc
     }, {})
-  ).sort((a, b) => b.count - a.count).slice(0, 4)
+  ).sort((a, b) => b.count - a.count).slice(0, 3)
 
   return (
-    <div style={{ background: C.bg, minHeight: '100vh', fontFamily: "'Inter',sans-serif" }}>
+    <div style={{ background: C.bg, minHeight: '100vh', fontFamily: "'Inter',sans-serif", paddingBottom: 100 }}>
 
       {/* ── Topbar ── */}
       <div style={{
@@ -380,7 +324,7 @@ export default function Home() {
             <div style={{ fontSize: 11, color: C.muted }}>Good day,</div>
             <div style={{ fontSize: 18, fontWeight: 700, color: C.black }}>
               {displayName === null
-                ? <span style={{ display: 'inline-block', width: 80, height: 16, borderRadius: 6, background: C.border, verticalAlign: 'middle' }} />
+                ? <span style={{ display: 'inline-block', width: 80, height: 16, borderRadius: 6, background: C.border, verticalAlign: 'middle' }}/>
                 : displayName
               }
             </div>
@@ -388,23 +332,19 @@ export default function Home() {
           <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
             {syncing && <Loader size={16} color={C.muted} style={{ animation: 'spin 1s linear infinite' }}/>}
             {newCount > 0 && (
-              <button
-                onClick={() => setNewCount(0)}
-                style={{
-                  background: C.orange, border: 'none', borderRadius: 99,
-                  padding: '4px 10px', cursor: 'pointer',
-                  fontSize: 10, fontWeight: 700, color: C.white,
-                  display: 'flex', alignItems: 'center', gap: 4,
-                }}
-              >
+              <button onClick={() => setNewCount(0)} style={{
+                background: C.orange, border: 'none', borderRadius: 99,
+                padding: '4px 10px', cursor: 'pointer',
+                fontSize: 10, fontWeight: 700, color: C.white,
+                display: 'flex', alignItems: 'center', gap: 4,
+              }}>
                 <RefreshCw size={10}/> {newCount} new
               </button>
             )}
             <button style={{
               width: 36, height: 36, borderRadius: '50%',
               background: C.bg, border: `1px solid ${C.border}`,
-              display: 'flex', alignItems: 'center', justifyContent: 'center',
-              cursor: 'pointer',
+              display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer',
             }}>
               <Bell size={17} color={C.black}/>
             </button>
@@ -423,110 +363,80 @@ export default function Home() {
             onChange={e => setSearchQuery(e.target.value)}
             placeholder="Search products, sellers…"
             style={{
-              flex: 1, border: 'none', background: 'none',
-              outline: 'none', fontSize: 14,
-              color: C.black, fontFamily: "'Inter',sans-serif",
+              flex: 1, border: 'none', background: 'none', outline: 'none',
+              fontSize: 14, color: C.black, fontFamily: "'Inter',sans-serif",
             }}
           />
+          {searchQuery && (
+            <button onClick={() => setSearchQuery('')} style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: 18, color: C.muted, lineHeight: 1, padding: 0 }}>×</button>
+          )}
         </div>
       </div>
 
       <div style={{ padding: '0 0 24px' }}>
 
-        {/* ── Cycling banner ── */}
+        {/* ── Banner ── */}
         <div style={{ margin: '16px 16px 0' }}>
           <div style={{
-            background: BANNERS[bannerIdx].bg,
-            borderRadius: 16, padding: '20px',
+            background: BANNERS[bannerIdx].bg, borderRadius: 16, padding: '20px',
             position: 'relative', overflow: 'hidden',
             transition: 'background 0.6s ease', minHeight: 130,
           }}>
             <div style={{
               position: 'absolute', right: -20, top: -20,
               width: 130, height: 130, borderRadius: '50%',
-              background: BANNERS[bannerIdx].bubble,
-              transition: 'background 0.6s ease',
+              background: BANNERS[bannerIdx].bubble, transition: 'background 0.6s ease',
             }}/>
-            <div style={{
-              fontSize: 10, fontWeight: 700,
-              color: BANNERS[bannerIdx].accent,
-              letterSpacing: '0.12em', marginBottom: 6,
-              transition: 'color 0.5s ease',
-            }}>
+            <div style={{ fontSize: 10, fontWeight: 700, color: BANNERS[bannerIdx].accent, letterSpacing: '0.12em', marginBottom: 6, transition: 'color 0.5s ease' }}>
               {BANNERS[bannerIdx].tag}
             </div>
-            <div style={{
-              fontSize: 19, fontWeight: 700,
-              color: '#ffffff', marginBottom: 14, lineHeight: 1.35,
-              whiteSpace: 'pre-line',
-            }}>
+            <div style={{ fontSize: 19, fontWeight: 700, color: '#ffffff', marginBottom: 14, lineHeight: 1.35, whiteSpace: 'pre-line' }}>
               {BANNERS[bannerIdx].title}
             </div>
-            <button
-              onClick={() => navigate(BANNERS[bannerIdx].path)}
-              style={{
-                background: BANNERS[bannerIdx].accent, border: 'none',
-                borderRadius: 99, padding: '8px 16px', cursor: 'pointer',
-                fontSize: 12, fontWeight: 700, color: BANNERS[bannerIdx].bg,
-                display: 'inline-flex', alignItems: 'center', gap: 6,
-                transition: 'background 0.5s ease, color 0.5s ease',
-              }}
-            >
+            <button onClick={() => navigate(BANNERS[bannerIdx].path)} style={{
+              background: BANNERS[bannerIdx].accent, border: 'none', borderRadius: 99,
+              padding: '8px 16px', cursor: 'pointer',
+              fontSize: 12, fontWeight: 700, color: BANNERS[bannerIdx].bg,
+              display: 'inline-flex', alignItems: 'center', gap: 6,
+              transition: 'background 0.5s ease, color 0.5s ease',
+            }}>
               <Zap size={13}/> {BANNERS[bannerIdx].cta}
             </button>
           </div>
-
           <div style={{ display: 'flex', justifyContent: 'center', gap: 6, marginTop: 10 }}>
             {BANNERS.map((_, i) => (
-              <button
-                key={i}
-                onClick={() => setBannerIdx(i)}
-                style={{
-                  width: i === bannerIdx ? 20 : 6, height: 6, borderRadius: 99,
-                  background: i === bannerIdx ? C.black : C.border,
-                  border: 'none', cursor: 'pointer', padding: 0,
-                  transition: 'all 0.3s ease',
-                }}
-              />
+              <button key={i} onClick={() => setBannerIdx(i)} style={{
+                width: i === bannerIdx ? 20 : 6, height: 6, borderRadius: 99,
+                background: i === bannerIdx ? C.black : C.border,
+                border: 'none', cursor: 'pointer', padding: 0, transition: 'all 0.3s ease',
+              }}/>
             ))}
           </div>
         </div>
 
         {/* ── Categories ── */}
         <div style={{ padding: '20px 16px 0' }}>
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14 }}>
-            <div style={{ fontSize: 16, fontWeight: 700, color: C.black }}>Categories</div>
-          </div>
+          <div style={{ fontSize: 16, fontWeight: 700, color: C.black, marginBottom: 14 }}>Categories</div>
           <div style={{ display: 'flex', gap: 10, overflowX: 'auto', paddingBottom: 4, scrollbarWidth: 'none' }}>
-            <button
-              onClick={() => setSelectedCat(null)}
-              style={{
-                flexShrink: 0, padding: '8px 16px', borderRadius: 99,
-                background: !selectedCat ? C.black : C.white,
-                border: `1px solid ${!selectedCat ? C.black : C.border}`,
-                cursor: 'pointer', fontSize: 12, fontWeight: 600,
-                color: !selectedCat ? C.white : C.black, transition: 'all .15s',
-              }}
-            >
-              All
-            </button>
+            <button onClick={() => setSelectedCat(null)} style={{
+              flexShrink: 0, padding: '8px 16px', borderRadius: 99,
+              background: !selectedCat ? C.black : C.white,
+              border: `1px solid ${!selectedCat ? C.black : C.border}`,
+              cursor: 'pointer', fontSize: 12, fontWeight: 600,
+              color: !selectedCat ? C.white : C.black, transition: 'all .15s',
+            }}>All</button>
             {CATEGORIES.map(({ icon: Icon, label, tag }) => {
               const active = selectedCat === tag
               return (
-                <button
-                  key={tag}
-                  onClick={() => setSelectedCat(active ? null : tag)}
-                  style={{
-                    flexShrink: 0, display: 'flex', alignItems: 'center', gap: 6,
-                    padding: '8px 14px', borderRadius: 99,
-                    background: active ? C.black : C.white,
-                    border: `1px solid ${active ? C.black : C.border}`,
-                    cursor: 'pointer', fontSize: 12, fontWeight: 600,
-                    color: active ? C.white : C.black, transition: 'all .15s',
-                  }}
-                >
-                  <Icon size={13} color={active ? C.white : C.ochre}/>
-                  {label}
+                <button key={tag} onClick={() => setSelectedCat(active ? null : tag)} style={{
+                  flexShrink: 0, display: 'flex', alignItems: 'center', gap: 6,
+                  padding: '8px 14px', borderRadius: 99,
+                  background: active ? C.black : C.white,
+                  border: `1px solid ${active ? C.black : C.border}`,
+                  cursor: 'pointer', fontSize: 12, fontWeight: 600,
+                  color: active ? C.white : C.black, transition: 'all .15s',
+                }}>
+                  <Icon size={13} color={active ? C.white : C.ochre}/> {label}
                 </button>
               )
             })}
@@ -545,47 +455,41 @@ export default function Home() {
           <div style={{ textAlign: 'center', padding: '60px 20px' }}>
             <ShoppingBag size={40} color={C.border} style={{ margin: '0 auto 16px', display: 'block' }}/>
             <div style={{ fontSize: 16, fontWeight: 600, color: C.black, marginBottom: 6 }}>
-              {searchQuery ? 'No results found' : 'No products yet'}
+              {searchQuery || selectedCat ? 'No results found' : 'No products yet'}
             </div>
             <div style={{ fontSize: 13, color: C.muted, marginBottom: 20 }}>
-              {searchQuery ? 'Try a different search' : 'Be the first seller on Bitsoko'}
+              {searchQuery || selectedCat ? 'Try a different filter' : 'Be the first seller on Bitsoko'}
             </div>
-            {!searchQuery && (
-              <button
-                onClick={() => navigate('/create-listing')}
-                style={{
-                  background: C.black, border: 'none', borderRadius: 12,
-                  padding: '12px 24px', cursor: 'pointer',
-                  fontSize: 14, fontWeight: 700, color: C.white,
-                  display: 'inline-flex', alignItems: 'center', gap: 8,
-                }}
-              >
+            {(!searchQuery && !selectedCat) && (
+              <button onClick={() => navigate('/create-listing')} style={{
+                background: C.black, border: 'none', borderRadius: 12,
+                padding: '12px 24px', cursor: 'pointer',
+                fontSize: 14, fontWeight: 700, color: C.white,
+                display: 'inline-flex', alignItems: 'center', gap: 8,
+              }}>
                 <Plus size={16}/> List a product
               </button>
             )}
           </div>
         )}
 
-        {/* ── Recent listings ── */}
-        {!loading && recent.length > 0 && (
+        {/* ── Listings ── */}
+        {!loading && visible.length > 0 && (
           <div style={{ padding: '20px 16px 0' }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14 }}>
               <div style={{ fontSize: 16, fontWeight: 700, color: C.black }}>
                 {selectedCat ? CATEGORIES.find(c => c.tag === selectedCat)?.label : 'Recent listings'}
               </div>
-              <button
-                onClick={() => navigate('/explore')}
-                style={{
-                  background: 'none', border: 'none', cursor: 'pointer',
-                  display: 'flex', alignItems: 'center', gap: 4,
-                  fontSize: 12, color: C.ochre, fontWeight: 600,
-                }}
-              >
+              <button onClick={() => navigate('/explore')} style={{
+                background: 'none', border: 'none', cursor: 'pointer',
+                display: 'flex', alignItems: 'center', gap: 4,
+                fontSize: 12, color: C.ochre, fontWeight: 600,
+              }}>
                 See all <ChevronRight size={14}/>
               </button>
             </div>
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
-              {recent.map(product => (
+              {visible.map(product => (
                 <ProductCard
                   key={product.id}
                   product={product}
@@ -594,16 +498,29 @@ export default function Home() {
                 />
               ))}
             </div>
+
+            {/* Load more */}
+            {visibleCount < sorted.length && (
+              <button onClick={() => setVisibleCount(c => c + PAGE_SIZE)} style={{
+                width: '100%', marginTop: 16, padding: 14,
+                background: C.white, border: `1.5px solid ${C.border}`,
+                borderRadius: 14, cursor: 'pointer',
+                fontSize: 13, fontWeight: 600, color: C.black,
+                fontFamily: "'Inter',sans-serif",
+              }}>
+                Load more · {sorted.length - visibleCount} remaining
+              </button>
+            )}
           </div>
         )}
 
-        {/* ── Top sellers ── */}
-        {!loading && topSellers.length > 0 && (
+        {/* ── Featured sellers (top 3) ── */}
+        {!loading && topSellers.length > 0 && !selectedCat && !searchQuery && (
           <div style={{ padding: '24px 16px 0' }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14 }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                 <TrendingUp size={16} color={C.ochre}/>
-                <span style={{ fontSize: 16, fontWeight: 700, color: C.black }}>Top sellers</span>
+                <span style={{ fontSize: 16, fontWeight: 700, color: C.black }}>Featured sellers</span>
               </div>
             </div>
             <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
@@ -612,16 +529,11 @@ export default function Home() {
                 const name    = profile?.name || profile?.display_name || pubkey.slice(0, 12) + '…'
                 const ln      = profile?.lud16 || ''
                 return (
-                  <div
-                    key={pubkey}
-                    onClick={() => navigate(`/seller/${pubkey}`)}
-                    style={{
-                      background: C.white, borderRadius: 14,
-                      border: `1px solid ${C.border}`, padding: '12px 16px',
-                      display: 'flex', alignItems: 'center', gap: 12,
-                      cursor: 'pointer',
-                    }}
-                  >
+                  <div key={pubkey} onClick={() => navigate(`/seller/${pubkey}`)} style={{
+                    background: C.white, borderRadius: 14,
+                    border: `1px solid ${C.border}`, padding: '12px 16px',
+                    display: 'flex', alignItems: 'center', gap: 12, cursor: 'pointer',
+                  }}>
                     <Avatar profile={profile} pubkey={pubkey} size={44}/>
                     <div style={{ flex: 1, minWidth: 0 }}>
                       <div style={{ fontSize: 14, fontWeight: 700, color: C.black }}>{name}</div>
@@ -644,36 +556,25 @@ export default function Home() {
         )}
 
         {/* ── Sell CTA ── */}
-        <div style={{
-          margin: '24px 16px 0',
-          background: C.white, borderRadius: 16,
-          border: `1px solid ${C.border}`, padding: '20px',
-          display: 'flex', alignItems: 'center', gap: 16,
-        }}>
-          <div style={{
-            width: 48, height: 48, borderRadius: 14,
-            background: C.bg, flexShrink: 0,
-            display: 'flex', alignItems: 'center', justifyContent: 'center',
-          }}>
-            <Store size={22} color={C.ochre}/>
-          </div>
-          <div style={{ flex: 1 }}>
-            <div style={{ fontSize: 14, fontWeight: 700, color: C.black, marginBottom: 2 }}>Start selling today</div>
-            <div style={{ fontSize: 11, color: C.muted }}>List products, get paid in sats</div>
-          </div>
-          <button
-            onClick={() => navigate('/create-listing')}
-            style={{
+        {!searchQuery && (
+          <div style={{ margin: '24px 16px 0', background: C.white, borderRadius: 16, border: `1px solid ${C.border}`, padding: '20px', display: 'flex', alignItems: 'center', gap: 16 }}>
+            <div style={{ width: 48, height: 48, borderRadius: 14, background: C.bg, flexShrink: 0, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+              <Store size={22} color={C.ochre}/>
+            </div>
+            <div style={{ flex: 1 }}>
+              <div style={{ fontSize: 14, fontWeight: 700, color: C.black, marginBottom: 2 }}>Start selling today</div>
+              <div style={{ fontSize: 11, color: C.muted }}>List products, get paid in sats</div>
+            </div>
+            <button onClick={() => navigate('/create-listing')} style={{
               background: C.black, border: 'none', borderRadius: 10,
               padding: '10px 16px', cursor: 'pointer',
               fontSize: 12, fontWeight: 700, color: C.white,
               display: 'flex', alignItems: 'center', gap: 6, flexShrink: 0,
-            }}
-          >
-            <Plus size={14}/> List
-          </button>
-        </div>
-
+            }}>
+              <Plus size={14}/> List
+            </button>
+          </div>
+        )}
       </div>
 
       <style>{`

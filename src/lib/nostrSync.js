@@ -1,37 +1,5 @@
 // ─────────────────────────────────────────────
 // nostrSync.js — Bitsoko Nostr sync layer
-//
-// Pattern based on Shopstr (shopstr-eng/shopstr) open source:
-//   1. Load IndexedDB instantly → show UI
-//   2. Fetch kind:30402 from relays — NO authors filter (global feed)
-//   3. Merge: newer created_at wins for same pubkey:d-tag key
-//   4. Cache back to IndexedDB
-//   5. Use user's NIP-65 relay list (kind:10002) for writes
-//
-// KEY FIX: fetchAndSeed now uses pool.querySync() not pool.subscribe()
-//   subscribe() fires EOSE before all relays respond → missed events
-//   querySync() awaits ALL relays properly → guaranteed results
-//
-// EVENT KINDS:
-//   kind:0     — Profile (NIP-01)
-//   kind:4     — Encrypted DM / order (NIP-04)
-//   kind:5     — Deletion (NIP-09)
-//   kind:10002 — User relay list (NIP-65)
-//   kind:30402 — Classified listing (NIP-99) ← PRIMARY
-//   kind:30403 — Draft/deleted listing (NIP-99)
-//
-// PRODUCT TAGS (kind:30402):
-//   ['d',            id]           — NIP-33 stable key
-//   ['title',        name]
-//   ['summary',      tagline]
-//   ['published_at', unixTs]
-//   ['location',     location]
-//   ['price',        sats, 'SATS']
-//   ['image',        url]          — one per image
-//   ['t',            category]     — one per category
-//   ['status',       'active'|'sold']
-//   ['quantity',     qty]
-//   ['shipping',     name, sats, 'SATS', regions]
 // ─────────────────────────────────────────────
 
 import { SimplePool }    from 'nostr-tools/pool'
@@ -42,7 +10,6 @@ import {
   saveOrder, getProductById, deleteProduct,
 } from './db'
 
-// ── Default fallback relays ───────────────────
 export const DEFAULT_RELAYS = [
   'wss://relay.damus.io',
   'wss://nos.lol',
@@ -52,7 +19,6 @@ export const DEFAULT_RELAYS = [
   'wss://relay.current.fyi',
 ]
 
-// Runtime relay list — populated from user's kind:10002 on login
 let _userRelays      = []
 let _userWriteRelays = []
 
@@ -67,7 +33,6 @@ export function getWriteRelays() { return _userWriteRelays.length ? _userWriteRe
 
 export const RELAYS = DEFAULT_RELAYS
 
-// ── Nostr event kinds ─────────────────────────
 export const KINDS = {
   PROFILE:       0,
   NOTE:          1,
@@ -79,7 +44,6 @@ export const KINDS = {
   AUTH:          27235,
 }
 
-// ── Singleton pool ────────────────────────────
 let _pool    = null
 let _liveSub = null
 
@@ -88,7 +52,6 @@ export function getPool() {
   return _pool
 }
 
-// ── Key helpers ───────────────────────────────
 export function getSecretKey() {
   const nsec = localStorage.getItem('bitsoko_nsec')
   if (!nsec) throw new Error('No secret key — please log in')
@@ -104,15 +67,11 @@ export function getPublicKeyHex() {
   return data
 }
 
-// ── Stable dedup key (same as Shopstr's getEventKey) ──
-// For kind:30402: pubkey + d-tag = product identity
-// Same pubkey+d = same product, newer created_at wins
 function stableKey(event) {
   const dTag = (event.tags || []).find(t => t[0] === 'd')?.[1]
   return dTag ? `${event.pubkey}:${dTag}` : event.id
 }
 
-// ── Deletion guard ────────────────────────────
 function isDeleted(event) {
   const tags   = event.tags || []
   const status = tags.find(t => t[0] === 'status')?.[1]
@@ -122,9 +81,6 @@ function isDeleted(event) {
   return false
 }
 
-// ─────────────────────────────────────────────
-// FETCH USER'S NIP-65 RELAY LIST (kind:10002)
-// ─────────────────────────────────────────────
 export async function fetchAndSetUserRelays(pubkeyHex) {
   try {
     const pool = getPool()
@@ -137,9 +93,10 @@ export async function fetchAndSetUserRelays(pubkeyHex) {
           const readRelays  = tags.filter(t => t[0] === 'r' && (!t[2] || t[2] === 'read')).map(t => t[1]).filter(Boolean)
           const writeRelays = tags.filter(t => t[0] === 'r' && (!t[2] || t[2] === 'write')).map(t => t[1]).filter(Boolean)
           const allRelays   = tags.filter(t => t[0] === 'r' && !t[2]).map(t => t[1]).filter(Boolean)
-          const finalRead   = readRelays.length  ? readRelays  : allRelays
-          const finalWrite  = writeRelays.length ? writeRelays : allRelays
-          setUserRelays(finalRead, finalWrite)
+          setUserRelays(
+            readRelays.length  ? readRelays  : allRelays,
+            writeRelays.length ? writeRelays : allRelays
+          )
           sub.close()
         },
         oneose() { sub.close() },
@@ -151,48 +108,18 @@ export async function fetchAndSetUserRelays(pubkeyHex) {
   }
 }
 
-// ─────────────────────────────────────────────
-// FETCH & SEED
-//
-// THE FIX: use pool.querySync() not pool.subscribe()
-//
-// pool.subscribe() fires oneose callback before all relays have
-// responded — especially slow or freshly-connected relays. This
-// caused cross-user products to be invisible and cleared-data
-// to never repopulate, because those events arrived after EOSE.
-//
-// pool.querySync() properly awaits ALL relays and returns a
-// complete array — same fix that solved the Profile page issue.
-//
-// Shopstr strategy:
-//   filter = { kinds: [30402] }  ← NO authors filter (global feed)
-//   merge  = newer created_at wins for same pubkey:d-tag key
-//   cache  = save everything to IndexedDB for next load
-// ─────────────────────────────────────────────
 export async function fetchAndSeed({ onProduct, onProfile, onDone } = {}) {
-  const pool = getPool()
-
-  // Always use union of user relays + DEFAULT_RELAYS
-  // This ensures we hit public relays AND the user's own relays
+  const pool   = getPool()
   const relays = [...new Set([...getReadRelays(), ...DEFAULT_RELAYS])]
 
-  console.log('[bitsoko] fetchAndSeed —', relays.length, 'relays, filter: { kinds: [30402] }')
-
   try {
-    // ── Step 1: Fetch ALL listings from ALL relays
-    // querySync awaits every relay properly — no missed events
     const [listingEvents, draftEvents] = await Promise.all([
       pool.querySync(relays, { kinds: [KINDS.LISTING],       limit: 500 }).catch(() => []),
       pool.querySync(relays, { kinds: [KINDS.LISTING_DRAFT], limit: 200 }).catch(() => []),
     ])
 
-    const allEvents = [...listingEvents, ...draftEvents]
-    console.log(`[bitsoko] querySync returned ${allEvents.length} raw events from ${relays.length} relays`)
-
-    // ── Step 2: Merge — newer created_at wins for same pubkey:d-tag
-    // Matches Shopstr's mergedProductsMap logic exactly
     const mergedMap = new Map()
-    for (const event of allEvents) {
+    for (const event of [...listingEvents, ...draftEvents]) {
       const key      = stableKey(event)
       const existing = mergedMap.get(key)
       if (!existing || event.created_at >= existing.created_at) {
@@ -200,9 +127,6 @@ export async function fetchAndSeed({ onProduct, onProfile, onDone } = {}) {
       }
     }
 
-    console.log(`[bitsoko] ${mergedMap.size} unique listings after merge`)
-
-    // ── Step 3: Save to IndexedDB + collect seller pubkeys
     const profilePubkeys = new Set()
     for (const [key, event] of mergedMap) {
       if (isDeleted(event)) {
@@ -214,11 +138,7 @@ export async function fetchAndSeed({ onProduct, onProfile, onDone } = {}) {
       }
     }
 
-    // ── Step 4: If still 0 results, fallback to own pubkey on write relays
-    // Handles the edge case where the user just published and global
-    // relays haven't indexed it yet — fetch directly from write relays
     if (mergedMap.size === 0) {
-      console.log('[bitsoko] 0 global results — running own-pubkey fallback on write relays')
       try {
         const npub = localStorage.getItem('bitsoko_npub')
         if (npub) {
@@ -228,33 +148,28 @@ export async function fetchAndSeed({ onProduct, onProfile, onDone } = {}) {
             writeRelays,
             { kinds: [KINDS.LISTING], authors: [myPubkey], limit: 100 }
           ).catch(() => [])
-
           for (const event of fallback) {
             if (!isDeleted(event)) {
               await saveProduct(event)
               profilePubkeys.add(event.pubkey)
               onProduct?.(event)
-              console.log('[bitsoko] fallback ✓', stableKey(event))
             }
           }
         }
       } catch(e) { console.warn('[bitsoko] fallback error:', e) }
     }
 
-    // ── Step 5: Fetch kind:0 profiles for all sellers we found
     if (profilePubkeys.size > 0) {
       const pubkeyArr = [...profilePubkeys]
       const profiles  = await pool.querySync(
         relays,
         { kinds: [KINDS.PROFILE], authors: pubkeyArr, limit: pubkeyArr.length * 2 }
       ).catch(() => [])
-
       for (const e of profiles) {
         await saveProfile(e.pubkey, e.content)
         onProfile?.(e)
       }
     }
-
   } catch(e) {
     console.error('[bitsoko] fetchAndSeed error:', e)
   }
@@ -262,19 +177,10 @@ export async function fetchAndSeed({ onProduct, onProfile, onDone } = {}) {
   onDone?.()
 }
 
-// ─────────────────────────────────────────────
-// LIVE SYNC — persistent WebSocket for new listings
-// Uses union of user relays + DEFAULT_RELAYS so live
-// updates work regardless of relay config state
-// ─────────────────────────────────────────────
 export function startSync({ onProduct, onProfile } = {}) {
   stopSync()
-
-  const pool  = getPool()
-  const since = Math.floor(Date.now() / 1000)
-
-  // FIX: union relays same as fetchAndSeed — live sync was missing
-  // public relays when user had their own relay list set
+  const pool   = getPool()
+  const since  = Math.floor(Date.now() / 1000)
   const relays = [...new Set([...getReadRelays(), ...DEFAULT_RELAYS])]
 
   _liveSub = pool.subscribe(
@@ -300,7 +206,6 @@ export function startSync({ onProduct, onProfile } = {}) {
       oneose() {},
     }
   )
-
   return _liveSub
 }
 
@@ -327,28 +232,58 @@ async function fetchProfileIfMissing(pubkey) {
 
 // ─────────────────────────────────────────────
 // PUBLISH LISTING (kind:30402 — NIP-99)
+//
+// FIX 1 — Duplicate listing on edit:
+//   productId passed from MyShop is the stableId (pubkey:d-tag).
+//   Using that whole string as the d tag creates a NEW product.
+//   Fix: if productId looks like a stableId (contains ':'), extract
+//   just the d-tag portion after the first pubkey segment.
+//
+// FIX 2 — Category filter never matches:
+//   Was doing c.toLowerCase() on categories before tagging.
+//   db.js saveProduct reads t-tags back as-is into p.categories.
+//   Home/Explore filter against full-name strings like 'Electronics'.
+//   Fix: store categories exactly as provided — no lowercasing.
 // ─────────────────────────────────────────────
 export async function publishProduct({
   name,
-  description = '',
-  summary     = '',
-  price       = 0,
-  images      = [],
-  quantity    = -1,
-  categories  = [],
-  shipping    = [],
-  location    = 'Nairobi, Kenya',
-  status      = 'active',
-  productId   = null,
+  description  = '',
+  summary      = '',
+  price        = 0,
+  images       = [],
+  quantity     = -1,
+  categories   = [],
+  shipping     = [],
+  location     = 'Nairobi, Kenya',
+  status       = 'active',
+  productId    = null,   // stableId from db (pubkey:d-tag) or null for new
+  isDeal       = false,
+  originalPrice = 0,
 }) {
-  const sk     = getSecretKey()
-  const pk     = getPublicKeyHex()
-  const now    = Math.floor(Date.now() / 1000)
-  const id     = productId || `bitsoko-${now}-${pk.slice(0, 8)}`
+  const sk  = getSecretKey()
+  const pk  = getPublicKeyHex()
+  const now = Math.floor(Date.now() / 1000)
+
+  // FIX 1: extract raw d-tag from stableId
+  // stableId format = "pubkeyHex:d-tag-value"
+  // pubkeyHex is always 64 hex chars, so split at char 65 (the colon)
+  let dTag
+  if (productId) {
+    if (productId.length > 65 && productId[64] === ':') {
+      // It's a stableId — extract the d-tag portion after pubkey:
+      dTag = productId.slice(65)
+    } else {
+      // It's already a raw d-tag (legacy or manually set)
+      dTag = productId
+    }
+  } else {
+    dTag = `bitsoko-${now}-${pk.slice(0, 8)}`
+  }
+
   const relays = getWriteRelays()
 
   const tags = [
-    ['d',            id],
+    ['d',            dTag],
     ['title',        name],
     ['summary',      summary || name],
     ['published_at', now.toString()],
@@ -358,10 +293,21 @@ export async function publishProduct({
     ['quantity',     quantity.toString()],
     ['t',            'bitsoko'],
     ['t',            'bitcoin'],
-    ...images.map(url => ['image',    url]),
-    ...categories.map(c => ['t',      c.toLowerCase()]),
-    ...shipping.map(s  => ['shipping', s.name || '', (s.cost || 0).toString(), 'SATS', s.regions || '']),
+    // FIX 2: NO .toLowerCase() — store categories exactly as provided
+    // so p.categories in db matches the filter values in Home/Explore
+    ...categories.map(c   => ['t',        c]),
+    ...images.map(url      => ['image',    url]),
+    ...shipping.map(s      => ['shipping', s.name || '', (s.cost || 0).toString(), 'SATS', s.regions || '']),
   ]
+
+  // Deal tags — adds to Deals page relay filter
+  if (isDeal) {
+    tags.push(['t', 'deal'])
+    tags.push(['t', 'sale'])
+    if (originalPrice > 0) {
+      tags.push(['original_price', originalPrice.toString(), 'SATS'])
+    }
+  }
 
   const event = finalizeEvent({
     kind:       KINDS.LISTING,
@@ -370,13 +316,10 @@ export async function publishProduct({
     content:    description,
   }, sk)
 
-  // Save to IndexedDB immediately (optimistic UI)
   await saveProduct(event)
 
-  // Publish to write relays + DEFAULT_RELAYS so the listing
-  // lands on public relays immediately for global visibility
   const publishRelays = [...new Set([...relays, ...DEFAULT_RELAYS])]
-  console.log('[bitsoko] publishing to', publishRelays.length, 'relays...')
+  console.log('[bitsoko] publishing to', publishRelays.length, 'relays, d-tag:', dTag)
 
   const results = await Promise.allSettled(
     publishRelays.map(relay =>
@@ -389,16 +332,14 @@ export async function publishProduct({
     )
   )
 
-  const ok   = results.filter(r => r.status === 'fulfilled').length
-  const fail = results.filter(r => r.status === 'rejected').map(r => r.reason?.message)
+  const ok = results.filter(r => r.status === 'fulfilled').length
   console.log(`[bitsoko] published to ${ok}/${publishRelays.length} relays`)
-  if (fail.length) console.warn('[bitsoko] failed relays:', fail)
 
   return event
 }
 
 // ─────────────────────────────────────────────
-// DELETE LISTING (two-layer)
+// DELETE LISTING
 // ─────────────────────────────────────────────
 export async function deleteProductEvent(productId) {
   const sk      = getSecretKey()
@@ -408,7 +349,7 @@ export async function deleteProductEvent(productId) {
   const dTag   = (product.tags || []).find(t => t[0] === 'd')?.[1] || productId
   const relays = [...new Set([...getWriteRelays(), ...DEFAULT_RELAYS])]
 
-  // Layer 1: NIP-09 kind:5
+  // NIP-09 kind:5 deletion
   const kind5 = finalizeEvent({
     kind:       KINDS.DELETE,
     created_at: Math.floor(Date.now() / 1000),
@@ -417,7 +358,7 @@ export async function deleteProductEvent(productId) {
   }, sk)
   try { await Promise.any(getPool().publish(relays, kind5)) } catch {}
 
-  // Layer 2: kind:30403 tombstone
+  // kind:30403 tombstone
   const tombstone = finalizeEvent({
     kind:       KINDS.LISTING_DRAFT,
     created_at: Math.floor(Date.now() / 1000) + 1,
@@ -437,23 +378,41 @@ export async function deleteProductEvent(productId) {
 
 // ─────────────────────────────────────────────
 // PUBLISH ORDER (kind:4 NIP-04 DM)
+//
+// FIX 3 — Human-readable order message
+// Was sending raw JSON that sellers couldn't read.
+// Now sends a clean text format buyers and sellers both understand.
 // ─────────────────────────────────────────────
 export async function publishOrder({ sellerPubkey, product, quantity, message = '' }) {
-  const sk     = getSecretKey()
-  const pk     = getPublicKeyHex()
-  const relays = getWriteRelays()
+  const sk      = getSecretKey()
+  const pk      = getPublicKeyHex()
+  const relays  = getWriteRelays()
+  const buyer   = localStorage.getItem('bitsoko_display_name') || 'A buyer'
 
-  const orderContent = {
-    id:         `order-${Date.now()}`,
-    type:       1,
-    name:       localStorage.getItem('bitsoko_display_name') || 'Buyer',
-    address:    '',
-    message,
-    items:      [{ product_id: product.id, quantity }],
-    created_at: Math.floor(Date.now() / 1000),
+  const satsToKsh = (sats) => {
+    const ksh = (sats / 100_000_000) * 13_000_000
+    return ksh >= 1000 ? `KSh ${(ksh/1000).toFixed(1)}k` : `KSh ${Math.round(ksh)}`
   }
 
-  const encrypted = await nip04.encrypt(sk, sellerPubkey, JSON.stringify(orderContent))
+  const total     = product.price * quantity
+  const totalFiat = satsToKsh(total)
+
+  // Human-readable order message — no JSON
+  const orderText = [
+    `🛒 New Order from Bitsoko`,
+    ``,
+    `Buyer: ${buyer}`,
+    ``,
+    `Product: ${product.name}`,
+    `Quantity: ${quantity}`,
+    `Price: ${product.price.toLocaleString()} sats${quantity > 1 ? ` × ${quantity}` : ''}`,
+    `Total: ${total.toLocaleString()} sats (≈ ${totalFiat})`,
+    message.trim() ? `\nNote from buyer:\n${message.trim()}` : '',
+    ``,
+    `Sent via Bitsoko ⚡ — reply to confirm`,
+  ].filter(line => line !== undefined).join('\n')
+
+  const encrypted = await nip04.encrypt(sk, sellerPubkey, orderText)
 
   const event = finalizeEvent({
     kind:       KINDS.DM,
@@ -463,18 +422,26 @@ export async function publishOrder({ sellerPubkey, product, quantity, message = 
   }, sk)
 
   await saveOrder({
-    id: event.id, pubkey: pk, seller: sellerPubkey,
-    product_id: product.id, product_name: product.name,
-    quantity, price: product.price * quantity,
-    status: 'pending', created_at: event.created_at, message,
+    id:           event.id,
+    pubkey:       pk,
+    seller_pubkey: sellerPubkey,
+    product_id:   product.id,
+    product_name: product.name,
+    product:      product,
+    quantity,
+    price:        total,
+    status:       'pending',
+    created_at:   event.created_at,
+    message,
   })
 
-  await Promise.any(getPool().publish(relays, event))
+  const publishRelays = [...new Set([...relays, ...DEFAULT_RELAYS])]
+  await Promise.any(getPool().publish(publishRelays, event))
   return event
 }
 
 // ─────────────────────────────────────────────
-// NIP-98 AUTH (nostr.build uploads)
+// NIP-98 AUTH
 // ─────────────────────────────────────────────
 export async function buildNip98Auth(uploadUrl, method = 'POST') {
   const sk = getSecretKey()
@@ -488,12 +455,12 @@ export async function buildNip98Auth(uploadUrl, method = 'POST') {
 }
 
 // ─────────────────────────────────────────────
-// IMAGE UPLOAD — nostr.build → nostrcheck.me → legacy
+// IMAGE UPLOAD
 // ─────────────────────────────────────────────
 export async function uploadImage(file) {
   const PROVIDERS = [
-    { name: 'nostr.build',        url: 'https://nostr.build/api/v2/upload/files',   field: 'fileToUpload', getUrl: j => j?.data?.[0]?.url,                  needsAuth: true  },
-    { name: 'nostrcheck.me',      url: 'https://nostrcheck.me/api/v2/media',         field: 'uploadedfile', getUrl: j => j?.url || j?.data?.url,              needsAuth: true  },
+    { name: 'nostr.build',        url: 'https://nostr.build/api/v2/upload/files',   field: 'fileToUpload', getUrl: j => j?.data?.[0]?.url,                   needsAuth: true  },
+    { name: 'nostrcheck.me',      url: 'https://nostrcheck.me/api/v2/media',         field: 'uploadedfile', getUrl: j => j?.url || j?.data?.url,               needsAuth: true  },
     { name: 'nostr.build legacy', url: 'https://nostr.build/api/upload/image',       field: 'fileToUpload', getUrl: j => j?.data?.display_url || j?.data?.url, needsAuth: false },
   ]
 

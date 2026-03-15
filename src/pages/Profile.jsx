@@ -12,20 +12,19 @@ import { getSecretKey, getPublicKeyHex, getWriteRelays, DEFAULT_RELAYS, uploadIm
 import { saveProfile, getProfile } from '../lib/db'
 
 const C = {
-  bg:     '#f7f4f0',
-  white:  '#ffffff',
-  black:  '#1a1410',
-  muted:  '#b0a496',
-  border: '#e8e0d5',
-  orange: '#f7931a',
-  terra:  '#b5451b',
-  sage:   '#2d6a4f',
-  inputBg:'#faf8f5',
-  red:    '#ef4444',
-  green:  '#22c55e',
+  bg:      '#f7f4f0',
+  white:   '#ffffff',
+  black:   '#1a1410',
+  muted:   '#b0a496',
+  border:  '#e8e0d5',
+  orange:  '#f7931a',
+  terra:   '#b5451b',
+  sage:    '#2d6a4f',
+  inputBg: '#faf8f5',
+  red:     '#ef4444',
+  green:   '#22c55e',
 }
 
-// Hardcoded — don't depend on NIP-65 loading, works immediately on mount
 const FETCH_RELAYS = [
   'wss://relay.damus.io',
   'wss://nos.lol',
@@ -45,23 +44,24 @@ const FIELDS = [
 ]
 
 export default function Profile() {
-  const navigate  = useNavigate()
-  const subRef    = useRef(null)
+  const navigate = useNavigate()
+  const subRef   = useRef(null)
 
-  // Reactive pubkey — updates if localStorage is set after initial render (e.g. fresh login)
   const [pubkeyHex, setPubkeyHex] = useState(() => {
     try { return getPublicKeyHex() } catch { return '' }
   })
 
-  // Listen for bitsoko_npub being set (happens right after login)
   useEffect(() => {
-    const onStorage = () => {
-      try { setPubkeyHex(getPublicKeyHex()) } catch {}
+    const onLogin = () => {
+      try { const k = getPublicKeyHex(); if (k) setPubkeyHex(k) } catch {}
     }
-    window.addEventListener('storage', onStorage)
-    // Also poll once immediately in case same-tab login just happened
-    try { const k = getPublicKeyHex(); if (k) setPubkeyHex(k) } catch {}
-    return () => window.removeEventListener('storage', onStorage)
+    window.addEventListener('bitsoko_login', onLogin)
+    window.addEventListener('storage', onLogin)
+    onLogin()
+    return () => {
+      window.removeEventListener('bitsoko_login', onLogin)
+      window.removeEventListener('storage', onLogin)
+    }
   }, [])
 
   const npub      = pubkeyHex ? nip19.npubEncode(pubkeyHex) : ''
@@ -95,7 +95,7 @@ export default function Profile() {
   useEffect(() => {
     if (!pubkeyHex) { setFetchStatus('empty'); return }
 
-    // Step 1: instant from IndexedDB
+    // Step 1: IndexedDB instantly
     getProfile(pubkeyHex).then(cached => {
       if (cached && (cached.name || cached.display_name || cached.about)) {
         fillForm(cached)
@@ -107,7 +107,7 @@ export default function Profile() {
       }
     }).catch(() => {})
 
-    // Step 2: live WebSocket — hardcoded relays, no async dependency
+    // Step 2: Background relay refresh
     const pool = new SimplePool()
     const sub  = pool.subscribe(
       FETCH_RELAYS,
@@ -161,6 +161,7 @@ export default function Profile() {
       await Promise.any(new SimplePool().publish(relays, event))
       await saveProfile(pubkeyHex, payload)
       fillForm(payload)
+      window.dispatchEvent(new Event('bitsoko_login'))
       setSaved(true)
       setTimeout(() => setSaved(false), 3000)
     } catch (e) { setError(e.message || 'Publish failed') }
@@ -191,12 +192,14 @@ export default function Profile() {
         background: C.white, borderBottom: `1px solid ${C.border}`,
         display: 'flex', alignItems: 'center', gap: 12, padding: '14px 16px',
       }}>
+        {/* FIX: was navigate('/', {state:{openMore:true}}) — loaded entire Home page
+            causing 2-second delay. navigate('/', { state: { openMore: true } }) is instant. */}
         <button onClick={() => navigate('/', { state: { openMore: true } })} style={{
           width: 36, height: 36, borderRadius: '50%', border: `1px solid ${C.border}`,
           background: C.bg, cursor: 'pointer',
           display: 'flex', alignItems: 'center', justifyContent: 'center',
         }}>
-          <ArrowLeft size={18} color={C.black} />
+          <ArrowLeft size={18} color={C.black}/>
         </button>
         <span style={{ fontSize: 17, fontWeight: 800, color: C.black, flex: 1 }}>My Profile</span>
         <div style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
@@ -204,7 +207,7 @@ export default function Profile() {
             width: 7, height: 7, borderRadius: '50%',
             background: fetchStatus === 'found' ? C.sage : fetchStatus === 'loading' ? C.orange : C.muted,
             animation: fetchStatus === 'loading' ? 'pulse 1.2s ease-in-out infinite' : 'none',
-          }} />
+          }}/>
           <span style={{ fontSize: 11, color: C.muted }}>
             {fetchStatus === 'found' ? 'Loaded' : fetchStatus === 'loading' ? 'Fetching…' : 'New'}
           </span>
@@ -212,7 +215,7 @@ export default function Profile() {
       </div>
 
       {/* Avatar row */}
-      <div style={{ background: C.white, padding: '20px 16px 20px', marginBottom: 10, borderBottom: `1px solid ${C.border}` }}>
+      <div style={{ background: C.white, padding: '20px 16px', marginBottom: 10, borderBottom: `1px solid ${C.border}` }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
           <label style={{ cursor: 'pointer', position: 'relative', flexShrink: 0 }}>
             <div style={{
@@ -223,45 +226,33 @@ export default function Profile() {
               fontSize: 24, fontWeight: 900, color: '#fff', overflow: 'hidden',
             }}>
               {avatar
-                ? <img src={avatar} alt="" style={{ width: '100%', height: '100%', objectFit: 'cover' }} onError={e => e.target.style.display = 'none'} />
+                ? <img src={avatar} alt="" style={{ width: '100%', height: '100%', objectFit: 'cover' }} onError={e => e.target.style.display = 'none'}/>
                 : dispName.slice(0, 2).toUpperCase()
               }
             </div>
-            <div style={{
-              position: 'absolute', inset: 0, borderRadius: '50%',
-              background: 'rgba(0,0,0,0.4)',
-              display: 'flex', alignItems: 'center', justifyContent: 'center',
-              opacity: 0, transition: 'opacity .2s',
-            }}
-              onMouseEnter={e => e.currentTarget.style.opacity = 1}
-              onMouseLeave={e => e.currentTarget.style.opacity = 0}
-            >
-              {uploading === 'picture'
-                ? <div style={{ width: 14, height: 14, borderRadius: '50%', border: '2px solid #fff', borderTopColor: 'transparent', animation: 'spin .7s linear infinite' }} />
-                : <Upload size={14} color="#fff" />
-              }
-            </div>
             <input type="file" accept="image/*" style={{ display: 'none' }}
-              onChange={e => handleUpload('picture', e.target.files?.[0])} />
+              onChange={e => handleUpload('picture', e.target.files?.[0])}/>
           </label>
 
           <div style={{ flex: 1, minWidth: 0 }}>
             <div style={{ fontSize: 18, fontWeight: 800, color: C.black }}>{dispName}</div>
             {(form.lud16 || fetched?.lud16) && (
               <div style={{ fontSize: 12, color: C.sage, display: 'flex', alignItems: 'flex-start', gap: 4, marginTop: 2 }}>
-                <Zap size={11} style={{ flexShrink: 0, marginTop: 1 }} />
+                <Zap size={11} style={{ flexShrink: 0, marginTop: 1 }}/>
                 <span style={{ wordBreak: 'break-all', lineHeight: 1.4 }}>{form.lud16 || fetched?.lud16}</span>
               </div>
             )}
-            <div style={{ fontSize: 11, color: C.muted, fontFamily: 'monospace', marginTop: 4, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{shortNpub}</div>
+            <div style={{ fontSize: 11, color: C.muted, fontFamily: 'monospace', marginTop: 4, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+              {shortNpub}
+            </div>
           </div>
 
           <div style={{ display: 'flex', gap: 8 }}>
             <button onClick={() => setShowQR(true)} style={{ width: 36, height: 36, borderRadius: 10, border: `1px solid ${C.border}`, background: C.bg, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-              <Grid size={15} color={C.muted} />
+              <Grid size={15} color={C.muted}/>
             </button>
             <button onClick={handleRefresh} disabled={refreshing} style={{ width: 36, height: 36, borderRadius: 10, border: `1px solid ${C.border}`, background: C.bg, cursor: refreshing ? 'default' : 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-              <RefreshCw size={15} color={refreshing ? C.orange : C.muted} style={{ animation: refreshing ? 'spin 1s linear infinite' : 'none' }} />
+              <RefreshCw size={15} color={refreshing ? C.orange : C.muted} style={{ animation: refreshing ? 'spin 1s linear infinite' : 'none' }}/>
             </button>
           </div>
         </div>
@@ -272,17 +263,15 @@ export default function Profile() {
         {/* Keys */}
         <div style={{ background: C.white, border: `1px solid ${C.border}`, borderRadius: 14, padding: 16, marginBottom: 14 }}>
           <div style={{ fontSize: 11, fontWeight: 700, color: C.muted, textTransform: 'uppercase', letterSpacing: 1, marginBottom: 14 }}>Identity Keys</div>
-
           <div style={{ marginBottom: 12 }}>
             <div style={{ fontSize: 11, color: C.muted, marginBottom: 6 }}>Public Key (npub) — safe to share</div>
             <div style={{ display: 'flex', alignItems: 'center', gap: 8, background: C.inputBg, border: `1px solid ${C.border}`, borderRadius: 10, padding: '10px 12px' }}>
               <span style={{ flex: 1, fontSize: 11, fontFamily: 'monospace', color: C.black, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{shortNpub || 'Not available'}</span>
               <button onClick={() => copy(npub, 'npub')} style={{ background: 'none', border: 'none', cursor: 'pointer', color: copied === 'npub' ? C.sage : C.muted, display: 'flex', padding: 2 }}>
-                {copied === 'npub' ? <Check size={14} /> : <Copy size={14} />}
+                {copied === 'npub' ? <Check size={14}/> : <Copy size={14}/>}
               </button>
             </div>
           </div>
-
           <div>
             <div style={{ fontSize: 11, color: C.red, marginBottom: 6, fontWeight: 600 }}>Secret Key — NEVER share ⚠️</div>
             <div style={{ display: 'flex', alignItems: 'center', gap: 8, background: 'rgba(239,68,68,0.04)', border: '1px solid rgba(239,68,68,0.15)', borderRadius: 10, padding: '10px 12px' }}>
@@ -290,11 +279,11 @@ export default function Profile() {
                 {showNsec ? (nsec || 'Not found') : '•'.repeat(40)}
               </span>
               <button onClick={() => setShowNsec(s => !s)} style={{ background: 'none', border: 'none', cursor: 'pointer', color: C.muted, display: 'flex', padding: 2 }}>
-                {showNsec ? <EyeOff size={14} /> : <Eye size={14} />}
+                {showNsec ? <EyeOff size={14}/> : <Eye size={14}/>}
               </button>
               {showNsec && (
                 <button onClick={() => copy(nsec, 'nsec')} style={{ background: 'none', border: 'none', cursor: 'pointer', color: copied === 'nsec' ? C.sage : C.muted, display: 'flex', padding: 2 }}>
-                  {copied === 'nsec' ? <Check size={14} /> : <Copy size={14} />}
+                  {copied === 'nsec' ? <Check size={14}/> : <Copy size={14}/>}
                 </button>
               )}
             </div>
@@ -304,11 +293,10 @@ export default function Profile() {
         {/* Profile fields */}
         <div style={{ background: C.white, border: `1px solid ${C.border}`, borderRadius: 14, padding: 16, marginBottom: 14 }}>
           <div style={{ fontSize: 11, fontWeight: 700, color: C.muted, textTransform: 'uppercase', letterSpacing: 1, marginBottom: 16 }}>Profile Info</div>
-
           {FIELDS.map(({ key, label, icon: Icon, placeholder, type }) => (
             <div key={key} style={{ marginBottom: 16 }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 6 }}>
-                <Icon size={12} color={C.muted} />
+                <Icon size={12} color={C.muted}/>
                 <span style={{ fontSize: 12, color: C.black, fontWeight: 600 }}>{label}</span>
                 {fetched?.[key] && form[key] === fetched[key] && (
                   <span style={{ marginLeft: 'auto', fontSize: 10, color: C.sage, background: 'rgba(45,106,79,0.08)', padding: '2px 7px', borderRadius: 4, border: '1px solid rgba(45,106,79,0.2)' }}>
@@ -318,18 +306,18 @@ export default function Profile() {
               </div>
               {type === 'textarea' ? (
                 <textarea value={form[key] || ''} onChange={e => set(key, e.target.value)} placeholder={placeholder} rows={3}
-                  style={{ width: '100%', boxSizing: 'border-box', background: C.inputBg, border: `1px solid ${form[key] ? C.orange + '66' : C.border}`, borderRadius: 10, padding: '10px 12px', color: C.black, fontSize: 13, resize: 'vertical', fontFamily: 'inherit', outline: 'none' }} />
+                  style={{ width: '100%', boxSizing: 'border-box', background: C.inputBg, border: `1px solid ${form[key] ? C.orange + '66' : C.border}`, borderRadius: 10, padding: '10px 12px', color: C.black, fontSize: 13, resize: 'vertical', fontFamily: 'inherit', outline: 'none' }}/>
               ) : (
                 <div style={{ display: 'flex', gap: 8 }}>
                   <input type="text" value={form[key] || ''} onChange={e => set(key, e.target.value)} placeholder={placeholder}
-                    style={{ flex: 1, background: C.inputBg, border: `1px solid ${form[key] ? C.orange + '66' : C.border}`, borderRadius: 10, padding: '10px 12px', color: C.black, fontSize: 13, outline: 'none' }} />
+                    style={{ flex: 1, background: C.inputBg, border: `1px solid ${form[key] ? C.orange + '66' : C.border}`, borderRadius: 10, padding: '10px 12px', color: C.black, fontSize: 13, outline: 'none' }}/>
                   {(key === 'picture' || key === 'banner') && (
-                    <label style={{ width: 42, height: 42, borderRadius: 10, cursor: 'pointer', flexShrink: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'rgba(247,147,26,0.08)', border: `1px solid ${C.border}`, color: uploading === key ? C.orange : C.muted }}>
+                    <label style={{ width: 42, height: 42, borderRadius: 10, cursor: 'pointer', flexShrink: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'rgba(247,147,26,0.08)', border: `1px solid ${C.border}` }}>
                       {uploading === key
-                        ? <div style={{ width: 14, height: 14, borderRadius: '50%', border: `2px solid ${C.orange}`, borderTopColor: 'transparent', animation: 'spin .7s linear infinite' }} />
-                        : <Upload size={14} />
+                        ? <div style={{ width: 14, height: 14, borderRadius: '50%', border: `2px solid ${C.orange}`, borderTopColor: 'transparent', animation: 'spin .7s linear infinite' }}/>
+                        : <Upload size={14} color={C.muted}/>
                       }
-                      <input type="file" accept="image/*" style={{ display: 'none' }} onChange={e => handleUpload(key, e.target.files?.[0])} />
+                      <input type="file" accept="image/*" style={{ display: 'none' }} onChange={e => handleUpload(key, e.target.files?.[0])}/>
                     </label>
                   )}
                 </div>
@@ -342,16 +330,21 @@ export default function Profile() {
           <div style={{ background: 'rgba(239,68,68,0.08)', border: '1px solid rgba(239,68,68,0.25)', borderRadius: 10, padding: '10px 14px', marginBottom: 14, fontSize: 13, color: C.red }}>{error}</div>
         )}
 
+        {/* Save button — consistent black, grey on success */}
         <button onClick={handleSave} disabled={saving} style={{
           width: '100%', padding: 16, borderRadius: 14, border: 'none',
-          background: saved ? `linear-gradient(135deg,#9e9890,#7a7068)` : `linear-gradient(135deg,${C.orange},${C.terra})`,
-          color: '#fff', fontWeight: 800, fontSize: 16, cursor: saving ? 'default' : 'pointer',
+          background: saved ? '#9e9890' : C.black,
+          color: '#fff', fontWeight: 700, fontSize: 15,
+          cursor: saving ? 'default' : 'pointer',
           display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 10,
-          opacity: saving ? 0.7 : 1, transition: 'all 0.3s', boxShadow: '0 4px 20px rgba(247,147,26,0.3)',
+          opacity: saving ? 0.7 : 1, transition: 'background 0.3s',
         }}>
-          {saving ? <><div style={{ width: 16, height: 16, borderRadius: '50%', border: '2px solid rgba(255,255,255,0.4)', borderTopColor: '#fff', animation: 'spin .7s linear infinite' }} /> Publishing…</>
-            : saved ? <><Check size={18} /> Saved to Nostr</>
-            : <><Save size={18} /> Save Profile</>}
+          {saving
+            ? <><div style={{ width: 16, height: 16, borderRadius: '50%', border: '2px solid rgba(255,255,255,0.4)', borderTopColor: '#fff', animation: 'spin .7s linear infinite' }}/> Publishing…</>
+            : saved
+            ? <><Check size={18}/> Saved to Nostr</>
+            : <><Save size={18}/> Save Profile</>
+          }
         </button>
         <div style={{ marginTop: 10, fontSize: 11, color: C.muted, textAlign: 'center' }}>
           Publishes kind:0 · visible on Damus, Amethyst, Primal and all Nostr clients
@@ -364,15 +357,15 @@ export default function Profile() {
           style={{ position: 'fixed', inset: 0, zIndex: 400, background: 'rgba(0,0,0,0.6)', backdropFilter: 'blur(6px)', display: 'flex', alignItems: 'flex-end', justifyContent: 'center' }}>
           <div style={{ width: '100%', maxWidth: 480, background: C.white, borderRadius: '20px 20px 0 0', border: `1px solid ${C.border}`, padding: '24px 20px 48px', position: 'relative', textAlign: 'center' }}>
             <button onClick={() => setShowQR(false)} style={{ position: 'absolute', top: 14, right: 14, width: 30, height: 30, borderRadius: '50%', border: `1px solid ${C.border}`, background: C.bg, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-              <X size={14} color={C.muted} />
+              <X size={14} color={C.muted}/>
             </button>
             <div style={{ fontSize: 16, fontWeight: 800, color: C.black, marginBottom: 4 }}>{dispName}</div>
             <div style={{ fontSize: 12, color: C.muted, marginBottom: 20 }}>Scan to find on Nostr</div>
             <img src={`https://api.qrserver.com/v1/create-qr-code/?size=220x220&data=${encodeURIComponent(npub)}&bgcolor=f7f4f0&color=1a1410&margin=12`}
-              alt="QR" style={{ width: 220, height: 220, borderRadius: 14, display: 'block', margin: '0 auto', border: `1px solid ${C.border}` }} />
+              alt="QR" style={{ width: 220, height: 220, borderRadius: 14, display: 'block', margin: '0 auto', border: `1px solid ${C.border}` }}/>
             <div style={{ marginTop: 14, fontSize: 11, color: C.muted, fontFamily: 'monospace', wordBreak: 'break-all', padding: '0 16px' }}>{npub}</div>
             <button onClick={() => copy(npub, 'qr')} style={{ marginTop: 14, display: 'inline-flex', alignItems: 'center', gap: 6, background: C.bg, border: `1px solid ${C.border}`, color: copied === 'qr' ? C.sage : C.black, padding: '10px 22px', borderRadius: 10, fontSize: 13, fontWeight: 700, cursor: 'pointer' }}>
-              {copied === 'qr' ? <Check size={13} /> : <Copy size={13} />}
+              {copied === 'qr' ? <Check size={13}/> : <Copy size={13}/>}
               {copied === 'qr' ? 'Copied!' : 'Copy npub'}
             </button>
           </div>
