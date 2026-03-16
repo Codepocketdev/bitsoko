@@ -7,6 +7,7 @@ import {
   Plus, Minus,
 } from 'lucide-react'
 import { publishProduct, uploadImage } from '../lib/nostrSync'
+import { satsToKsh, useRate } from '../lib/rates'
 
 const C = {
   bg:     '#f7f4f0',
@@ -152,7 +153,7 @@ function PhotoStep({ images, setImages }) {
 }
 
 // ── Step 2: Details ───────────────────────────
-function DetailsStep({ name, setName, description, setDescription, categories, setCategories, isDeal, setIsDeal, discountPct, setDiscountPct, preDealPrice, setPreDealPrice, price, setPrice }) {
+function DetailsStep({ name, setName, description, setDescription, categories, setCategories, isDeal, setIsDeal, discountPct, setDiscountPct, preDealPrice, setPreDealPrice, price, setPrice, rate }) {
   const toggle = (cat) =>
     setCategories(prev => prev.includes(cat) ? prev.filter(c => c !== cat) : [...prev, cat])
 
@@ -231,15 +232,12 @@ function DetailsStep({ name, setName, description, setDescription, categories, s
             Featured on the Deals page — use for promotions, flash sales, or clearing stock fast.
           </div>
         </div>
-        {/* Toggle switch */}
         <button onClick={() => {
             if (isDeal) {
-              // Turning OFF — restore pre-deal price
               if (preDealPrice) setPrice(preDealPrice)
               setDiscountPct('')
               setPreDealPrice('')
             } else {
-              // Turning ON — save current price as pre-deal
               setPreDealPrice(price)
             }
             setIsDeal(d => !d)
@@ -259,7 +257,6 @@ function DetailsStep({ name, setName, description, setDescription, categories, s
         </button>
       </div>
 
-      {/* Discount % — only shown when isDeal is on */}
       {isDeal && (
         <div style={{ marginTop: 12, padding: '14px 16px', background: 'rgba(232,97,74,0.04)', border: `1px solid rgba(232,97,74,0.15)`, borderRadius: 12 }}>
           <label style={{ display:'block', fontSize:'0.75rem', fontWeight:600, color:C.deal, marginBottom:8 }}>
@@ -286,7 +283,7 @@ function DetailsStep({ name, setName, description, setDescription, categories, s
               {' '}→ Now: <strong style={{ color:'#e8614a' }}>
                 {Math.round(parseInt(price)*(1-parseInt(discountPct)/100)).toLocaleString()} sats
               </strong>
-              {' '}(KSh {Math.round((Math.round(parseInt(price)*(1-parseInt(discountPct)/100))/100000000)*13000000).toLocaleString()})
+              {' '}({satsToKsh(Math.round(parseInt(price)*(1-parseInt(discountPct)/100)), rate)})
             </div>
           )}
         </div>
@@ -296,8 +293,8 @@ function DetailsStep({ name, setName, description, setDescription, categories, s
 }
 
 // ── Step 3: Price ─────────────────────────────
-function PriceStep({ price, setPrice, quantity, setQuantity, shipping, setShipping }) {
-  const ksh = price ? Math.round((parseInt(price) / 100_000_000) * 13_000_000) : 0
+function PriceStep({ price, setPrice, quantity, setQuantity, shipping, setShipping, rate }) {
+  const ksh = price ? Math.round((parseInt(price) / 100_000_000) * (rate || 13_000_000)) : 0
 
   const addShipping    = () => setShipping(prev => [...prev, { name: '', cost: '', regions: '' }])
   const removeShipping = (i) => setShipping(prev => prev.filter((_, idx) => idx !== i))
@@ -375,8 +372,8 @@ function PriceStep({ price, setPrice, quantity, setQuantity, shipping, setShippi
 }
 
 // ── Step 4: Publish ───────────────────────────
-function PublishStep({ images, name, description, categories, price, quantity, shipping, isDeal, status, errMsg }) {
-  const ksh = price ? Math.round((parseInt(price) / 100_000_000) * 13_000_000) : 0
+function PublishStep({ images, name, description, categories, price, quantity, shipping, isDeal, status, errMsg, rate }) {
+  const ksh = price ? Math.round((parseInt(price) / 100_000_000) * (rate || 13_000_000)) : 0
   return (
     <div>
       <div style={{ marginBottom: 20 }}>
@@ -466,6 +463,7 @@ function PublishStep({ images, name, description, categories, price, quantity, s
 export default function CreateListing() {
   const navigate = useNavigate()
   const draft    = loadDraft()
+  const rate     = useRate() // ← live BTC/KES rate
 
   const [step,        setStep]        = useState(draft?.step        ?? 1)
   const [images,      setImages]      = useState(draft?.images      ?? [])
@@ -481,7 +479,6 @@ export default function CreateListing() {
   const [status,      setStatus]      = useState('idle')
   const [errMsg,      setErrMsg]      = useState('')
 
-  // Auto-save draft
   useEffect(() => {
     saveDraft({ step, images, name, description, categories, isDeal, discountPct, price, quantity, shipping })
   }, [step, images, name, description, categories, isDeal, price, quantity, shipping])
@@ -505,8 +502,6 @@ export default function CreateListing() {
         description: description.trim(),
         price:       parseInt(price),
         images, quantity, categories, shipping,
-        // originalPrice = was-price (current price before discount)
-        // price passed to publishProduct = sale price (reduced by pct)
         ...(() => {
           const pct = parseInt(discountPct)
           const p   = parseInt(price)
@@ -558,8 +553,11 @@ export default function CreateListing() {
             name={name} setName={setName}
             description={description} setDescription={setDescription}
             categories={categories} setCategories={setCategories}
-            isDeal={isDeal} setIsDeal={setIsDeal} preDealPrice={preDealPrice} setPreDealPrice={setPreDealPrice} price={price} setPrice={setPrice}
-          discountPct={discountPct} setDiscountPct={setDiscountPct}
+            isDeal={isDeal} setIsDeal={setIsDeal}
+            preDealPrice={preDealPrice} setPreDealPrice={setPreDealPrice}
+            price={price} setPrice={setPrice}
+            discountPct={discountPct} setDiscountPct={setDiscountPct}
+            rate={rate}
           />
         )}
         {step === 3 && (
@@ -567,6 +565,7 @@ export default function CreateListing() {
             price={price} setPrice={setPrice}
             quantity={quantity} setQuantity={setQuantity}
             shipping={shipping} setShipping={setShipping}
+            rate={rate}
           />
         )}
         {step === 4 && (
@@ -575,6 +574,7 @@ export default function CreateListing() {
             categories={categories} price={price} quantity={quantity}
             shipping={shipping} isDeal={isDeal}
             status={status} errMsg={errMsg}
+            rate={rate}
           />
         )}
       </div>

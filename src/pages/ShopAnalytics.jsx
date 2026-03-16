@@ -5,10 +5,11 @@ import {
   ArrowLeft, Zap, Loader, Package,
   TrendingUp, Tag, Truck, AlertTriangle,
   CheckCircle, BarChart2, Clock, Star,
-  RefreshCw, ShieldCheck,
+  RefreshCw, ShieldCheck, Store,
 } from 'lucide-react'
 import { getPool, getReadRelays, DEFAULT_RELAYS, KINDS } from '../lib/nostrSync'
 import { saveProduct } from '../lib/db'
+import { satsToKsh, useRate } from '../lib/rates'
 import { nip19 } from 'nostr-tools'
 
 const C = {
@@ -21,13 +22,7 @@ const C = {
   ochre:  '#c8860a',
   terra:  '#b5451b',
   red:    '#ef4444',
-  green:  '#22c55e',
-}
-
-function satsToKsh(sats) {
-  const ksh = (sats / 100_000_000) * 13_000_000
-  if (ksh >= 1000) return `KSh ${(ksh/1000).toFixed(1)}k`
-  return `KSh ${Math.round(ksh)}`
+  green:  '#f7931a',
 }
 
 function getMyPubkeyHex() {
@@ -87,6 +82,7 @@ function StatCard({ label, value, sub, icon: Icon, color }) {
 export default function ShopAnalytics() {
   const navigate    = useNavigate()
   const pubkeyHex   = getMyPubkeyHex()
+  const rate        = useRate() // ← live BTC/KES rate
   const CACHE_KEY   = `bitsoko_analytics_${pubkeyHex}`
 
   const [products,   setProducts]   = useState(() => {
@@ -94,7 +90,6 @@ export default function ShopAnalytics() {
   })
   const [loading,    setLoading]    = useState(true)
   const [lastFetch,  setLastFetch]  = useState(null)
-  const [chartRange, setChartRange] = useState('month')
 
   const fetchFromRelay = async () => {
     if (!pubkeyHex) { setLoading(false); return }
@@ -120,7 +115,6 @@ export default function ShopAnalytics() {
   }
 
   useEffect(() => {
-    // Show cache immediately if available
     const c = localStorage.getItem(CACHE_KEY)
     if (c) { try { setProducts(JSON.parse(c)); setLoading(false) } catch {} }
     fetchFromRelay()
@@ -141,7 +135,6 @@ export default function ShopAnalytics() {
   const minPrice   = active.length ? Math.min(...active.map(p=>p.price||0)) : 0
   const maxPrice   = active.length ? Math.max(...active.map(p=>p.price||0)) : 0
 
-  // Category breakdown
   const catMap = {}
   for (const p of active) {
     for (const c of (p.categories||[])) {
@@ -150,7 +143,6 @@ export default function ShopAnalytics() {
   }
   const topCats = Object.entries(catMap).sort((a,b)=>b[1]-a[1]).slice(0,5)
 
-  // Health score (0–100)
   const n = active.length
   const score = n === 0 ? 0 : Math.round(
     (withImg.length/n * 30) +
@@ -159,9 +151,8 @@ export default function ShopAnalytics() {
     (withQty.length/n * 15) +
     (Math.min(n, 10)/10 * 10)
   )
-  const scoreColor = score >= 70 ? C.green : score >= 40 ? C.ochre : C.red
+  const scoreColor = score >= 70 ? C.orange : score >= 40 ? C.ochre : C.red
 
-  // Listing quality tips
   const tips = []
   if (active.length - withImg.length > 0)
     tips.push({ icon: Package, msg: `${active.length - withImg.length} listing${active.length - withImg.length!==1?'s':''} missing photos — buyers skip listings without images` })
@@ -176,13 +167,12 @@ export default function ShopAnalytics() {
   if (tips.length === 0 && active.length > 0)
     tips.push({ icon: CheckCircle, msg: 'Great work! Your shop is well optimised.' })
 
-  // Price distribution buckets (sats)
   const buckets = [
-    { label: '< 1k',    min: 0,       max: 1000   },
-    { label: '1k–10k',  min: 1000,    max: 10000  },
-    { label: '10k–50k', min: 10000,   max: 50000  },
-    { label: '50k–100k',min: 50000,   max: 100000 },
-    { label: '> 100k',  min: 100000,  max: Infinity },
+    { label: '< 1k',     min: 0,      max: 1000      },
+    { label: '1k–10k',   min: 1000,   max: 10000     },
+    { label: '10k–50k',  min: 10000,  max: 50000     },
+    { label: '50k–100k', min: 50000,  max: 100000    },
+    { label: '> 100k',   min: 100000, max: Infinity   },
   ]
   const priceDist = buckets.map(b => ({
     ...b, count: active.filter(p => p.price >= b.min && p.price < b.max).length
@@ -213,7 +203,6 @@ export default function ShopAnalytics() {
 
       <div style={{ padding:'16px' }}>
 
-        {/* No listings */}
         {!loading && active.length === 0 && (
           <div style={{ textAlign:'center', padding:'48px 20px' }}>
             <Store size={44} color={C.border} style={{ margin:'0 auto 12px', display:'block' }}/>
@@ -245,12 +234,12 @@ export default function ShopAnalytics() {
             {/* Stat row 1 */}
             <div style={{ display:'flex', gap:10, marginBottom:10 }}>
               <StatCard label="Active listings" value={active.length} sub={`${deleted.length} archived`} icon={Package} color={C.ochre}/>
-              <StatCard label="Catalog value" value={`${(totalValue/1000).toFixed(0)}k`} sub={satsToKsh(totalValue)} icon={Zap} color={C.orange}/>
+              <StatCard label="Catalog value" value={`${(totalValue/1000).toFixed(0)}k`} sub={satsToKsh(totalValue, rate)} icon={Zap} color={C.orange}/>
             </div>
 
             {/* Stat row 2 */}
             <div style={{ display:'flex', gap:10, marginBottom:14 }}>
-              <StatCard label="Avg price" value={`${(avgPrice/1000).toFixed(1)}k`} sub={`sats · ${satsToKsh(avgPrice)}`} icon={TrendingUp} color={C.sage||C.green}/>
+              <StatCard label="Avg price" value={`${(avgPrice/1000).toFixed(1)}k`} sub={`sats · ${satsToKsh(avgPrice, rate)}`} icon={TrendingUp} color={C.green}/>
               <StatCard label="With photos" value={`${withImg.length}/${active.length}`} sub={`${Math.round(withImg.length/active.length*100)}% coverage`} icon={Star} color={C.green}/>
             </div>
 
