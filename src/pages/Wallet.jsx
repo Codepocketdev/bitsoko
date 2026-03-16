@@ -11,6 +11,7 @@ import {
   RotateCcw, Plus,
 } from 'lucide-react'
 import { useNpubcash } from '../hooks/useNpubcash'
+import { satsToKsh, useRate } from '../lib/rates'
 import {
   getWalletData, getBalance, saveMints,
   createMintInvoice, pollMintQuote,
@@ -26,16 +27,14 @@ const C = {
   black:   '#1a1410',
   muted:   '#b0a496',
   border:  '#e8e0d5',
-  orange:  '#f7931a',   // send / pay (Lightning orange)
+  orange:  '#f7931a',
   ochre:   '#c8860a',
   red:     '#ef4444',
-  // Receive = glassy gray (not green — green is for success only)
   glass:   'rgba(247,244,240,0.85)',
   glassBorder: 'rgba(176,164,150,0.4)',
-  green:   '#22c55e',   // success states only
+  green:   '#22c55e',
 }
 
-// TX colors: orange=send/debit, gray=receive/credit
 const TX_CONFIG = {
   1: { label:'Token received',  color:C.ochre,  debit:false, Icon:ArrowDownToLine },
   2: { label:'Token sent',      color:C.orange, debit:true,  Icon:ArrowUpFromLine },
@@ -45,12 +44,6 @@ const TX_CONFIG = {
 }
 
 const PENDING_QUOTE_KEY = 'bitsoko_pending_mint_quote'
-
-function satsToKsh(sats) {
-  const ksh = (sats / 100_000_000) * 13_000_000
-  if (ksh >= 1000) return `KSh ${(ksh/1000).toFixed(1)}k`
-  return `KSh ${Math.round(ksh)}`
-}
 
 function timeAgo(ts) {
   const s = Math.floor(Date.now() / 1000) - ts
@@ -140,7 +133,7 @@ function ReceiveMenuSheet({ onClose, onSelect }) {
 // ── Send menu sheet ────────────────────────────
 function SendMenuSheet({ onClose, onSelect }) {
   const options = [
-    { key:'pay',  Icon:Zap,            label:'Pay invoice',  sub:'Pay a Lightning invoice or LN address' },
+    { key:'pay',  Icon:Zap,             label:'Pay invoice',  sub:'Pay a Lightning invoice or LN address' },
     { key:'send', Icon:ArrowUpFromLine, label:'Send token',   sub:'Generate a Cashu token to share'       },
   ]
   return (
@@ -166,7 +159,7 @@ function SendMenuSheet({ onClose, onSelect }) {
 }
 
 // ── Add Funds sheet ────────────────────────────
-function MintSheet({ onClose, onSuccess }) {
+function MintSheet({ onClose, onSuccess, rate }) {
   const [amount,     setAmount]     = useState('')
   const [step,       setStep]       = useState('input')
   const [invoice,    setInvoice]    = useState('')
@@ -195,7 +188,7 @@ function MintSheet({ onClose, onSuccess }) {
         (err) => { clearPendingQuote(); setStep('error'); setErrMsg(err) }
       )
       setCancelPoll(() => cancel)
-    } catch(e) { console.warn('Resume failed:', e.message) }
+    } catch(e) {}
   }
 
   const handleMint = async () => {
@@ -231,7 +224,7 @@ function MintSheet({ onClose, onSuccess }) {
             <input type="number" min="1" autoFocus value={amount} onChange={e=>setAmount(e.target.value)} onKeyDown={e=>e.key==='Enter'&&handleMint()} placeholder="Amount in sats"
               style={{ width:'100%',padding:'13px 13px 13px 34px',background:C.bg,border:`1.5px solid ${amount?C.black:C.border}`,borderRadius:12,outline:'none',fontSize:16,fontWeight:600,color:C.black,boxSizing:'border-box' }}/>
           </div>
-          {amount && parseInt(amount)>0 && <div style={{ fontSize:11,color:C.muted,marginBottom:12 }}>≈ {satsToKsh(parseInt(amount))}</div>}
+          {amount && parseInt(amount)>0 && <div style={{ fontSize:11,color:C.muted,marginBottom:12 }}>≈ {satsToKsh(parseInt(amount), rate)}</div>}
           <div style={{ display:'flex',gap:8,marginBottom:20 }}>
             {QUICK.map(n => (
               <button key={n} onClick={()=>setAmount(String(n))} style={{ flex:1,padding:'8px 4px',borderRadius:10,background:parseInt(amount)===n?C.black:C.bg,border:`1px solid ${parseInt(amount)===n?C.black:C.border}`,cursor:'pointer',fontSize:11,fontWeight:600,color:parseInt(amount)===n?C.white:C.black }}>
@@ -280,7 +273,7 @@ function MintSheet({ onClose, onSuccess }) {
 }
 
 // ── Pay sheet ──────────────────────────────────
-function PaySheet({ onClose, onSuccess }) {
+function PaySheet({ onClose, onSuccess, rate }) {
   const [input,   setInput]   = useState('')
   const [lnAmt,   setLnAmt]   = useState('')
   const [decoded, setDecoded] = useState(null)
@@ -480,18 +473,15 @@ function ReceiveSheet({ onClose, onSuccess }) {
 }
 
 // ── LN Address sheet ───────────────────────────
-// Auto-claims on payment detection (page must be open)
 function LnAddressSheet({ onClose, onSatsReceived }) {
-  const nsec   = localStorage.getItem('bitsoko_nsec')
+  const nsec = localStorage.getItem('bitsoko_nsec')
   const [copied,   setCopied]   = useState(false)
   const [claimMsg, setClaimMsg] = useState('')
 
-  // Polling already running in WalletInner — just show LN address here
   const npubcash = useNpubcash({
     nsec:    nsec || '',
     enabled: !!nsec,
     onTokenClaimed: async (token, amount) => {
-      // Handled by WalletInner — just show notification here
       setClaimMsg(`${amount} sats received`)
       onSatsReceived?.()
       setTimeout(() => setClaimMsg(''), 4000)
@@ -506,8 +496,6 @@ function LnAddressSheet({ onClose, onSatsReceived }) {
       <div style={{ fontSize:13,color:C.muted,marginBottom:16,lineHeight:1.6 }}>
         Anyone can pay this address to send sats to your wallet. Auto-claimed when this page is open.
       </div>
-
-      {/* Auto-claiming indicator */}
       {npubcash.balance > 0 && (
         <div style={{ background:'rgba(247,147,26,0.08)',border:`1px solid rgba(247,147,26,0.3)`,borderRadius:12,padding:'12px 16px',marginBottom:16,display:'flex',alignItems:'center',gap:10 }}>
           <Loader size={14} color={C.orange} style={{ animation:'spin 1s linear infinite',flexShrink:0 }}/>
@@ -517,13 +505,11 @@ function LnAddressSheet({ onClose, onSatsReceived }) {
           </div>
         </div>
       )}
-
       {claimMsg && (
         <div style={{ display:'flex',alignItems:'center',gap:8,padding:'10px 14px',borderRadius:10,background:'rgba(247,147,26,0.06)',border:`1px solid rgba(247,147,26,0.2)`,fontSize:12,color:C.ochre,marginBottom:12 }}>
           <CheckCircle size={13}/> {claimMsg}
         </div>
       )}
-
       {lnAddr ? (
         <>
           <div style={{ background:'rgba(247,147,26,0.08)',border:`1px solid rgba(247,147,26,0.3)`,borderRadius:12,padding:'14px 16px',marginBottom:16,wordBreak:'break-all',fontSize:13,fontWeight:600,color:C.black,textAlign:'center' }}>
@@ -604,6 +590,8 @@ function MintSettingsSheet({ onClose }) {
 // ── Main wallet ────────────────────────────────
 function WalletInner() {
   const navigate = useNavigate()
+  const rate     = useRate()  // ← live BTC/KES rate, polls every 60s
+
   const [balance,     setBalance]     = useState(0)
   const [history,     setHistory]     = useState([])
   const [showBalance, setShowBalance] = useState(true)
@@ -617,13 +605,11 @@ function WalletInner() {
 
   useEffect(() => { reload() }, [reload])
 
-  // Resume pending mint quote on load
   useEffect(() => {
     const pending = loadPendingQuote()
     if (pending && Date.now() / 1000 - pending.createdAt < 600) setSheet('mint')
   }, [])
 
-  // Poll npub.cash for incoming LN payments whenever wallet page is open
   const nsec = localStorage.getItem('bitsoko_nsec')
   useNpubcash({
     nsec:    nsec || '',
@@ -632,8 +618,7 @@ function WalletInner() {
       try {
         await receiveCashuToken(token)
         reload()
-        console.log('[bitsoko wallet] auto-claimed', amount, 'sats from npub.cash')
-      } catch(e) { console.warn('[bitsoko wallet] auto-claim failed:', e.message) }
+      } catch(e) {}
     }
   })
 
@@ -668,7 +653,7 @@ function WalletInner() {
                     <span style={{ fontSize:40,fontWeight:800,color:C.white,lineHeight:1 }}>{balance.toLocaleString()}</span>
                     <span style={{ fontSize:15,color:'rgba(255,255,255,0.4)' }}>sats</span>
                   </div>
-                  <div style={{ fontSize:13,color:'rgba(255,255,255,0.4)',marginTop:4 }}>≈ {satsToKsh(balance)}</div>
+                  <div style={{ fontSize:13,color:'rgba(255,255,255,0.4)',marginTop:4 }}>≈ {satsToKsh(balance, rate)}</div>
                 </>
               ) : (
                 <div style={{ fontSize:40,fontWeight:800,color:'rgba(255,255,255,0.2)',letterSpacing:4 }}>••••••</div>
@@ -734,7 +719,7 @@ function WalletInner() {
         )}
 
         {history.map((tx, i) => {
-          const cfg   = TX_CONFIG[tx.type] || TX_CONFIG[4]
+          const cfg    = TX_CONFIG[tx.type] || TX_CONFIG[4]
           const TxIcon = cfg.Icon
           return (
             <div key={i} style={{ display:'flex',alignItems:'center',gap:12,padding:'12px 0',borderBottom:`1px solid ${C.bg}` }}>
@@ -749,7 +734,7 @@ function WalletInner() {
                 <div style={{ fontSize:13,fontWeight:700,color:cfg.debit?C.orange:C.black }}>
                   {cfg.debit?'−':'+'}{(tx.amount||0).toLocaleString()} sats
                 </div>
-                <div style={{ fontSize:10,color:C.muted }}>{satsToKsh(tx.amount||0)}</div>
+                <div style={{ fontSize:10,color:C.muted }}>{satsToKsh(tx.amount||0, rate)}</div>
               </div>
             </div>
           )
@@ -767,8 +752,8 @@ function WalletInner() {
 
       {sheet === 'receiveMenu'  && <ReceiveMenuSheet  onClose={()=>setSheet(null)} onSelect={k=>setSheet(k)}/>}
       {sheet === 'sendMenu'     && <SendMenuSheet     onClose={()=>setSheet(null)} onSelect={k=>setSheet(k)}/>}
-      {sheet === 'mint'         && <MintSheet        onClose={()=>{ setSheet(null); reload() }} onSuccess={reload}/>}
-      {sheet === 'pay'          && <PaySheet          onClose={()=>setSheet(null)} onSuccess={reload}/>}
+      {sheet === 'mint'         && <MintSheet         onClose={()=>{ setSheet(null); reload() }} onSuccess={reload} rate={rate}/>}
+      {sheet === 'pay'          && <PaySheet          onClose={()=>setSheet(null)} onSuccess={reload} rate={rate}/>}
       {sheet === 'send'         && <SendSheet         onClose={()=>{ setSheet(null); reload() }}/>}
       {sheet === 'receive'      && <ReceiveSheet      onClose={()=>setSheet(null)} onSuccess={reload}/>}
       {sheet === 'lnaddress'    && <LnAddressSheet    onClose={()=>setSheet(null)} onSatsReceived={reload}/>}

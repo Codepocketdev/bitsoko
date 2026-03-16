@@ -9,6 +9,7 @@ import {
   saveProduct, saveProfile,
   saveOrder, getProductById, deleteProduct,
 } from './db'
+import { getRate } from './rates'
 
 export const DEFAULT_RELAYS = [
   'wss://relay.damus.io',
@@ -34,8 +35,6 @@ export function getWriteRelays() { return _userWriteRelays.length ? _userWriteRe
 export const RELAYS = DEFAULT_RELAYS
 
 // ── Bitsoko-only toggle ───────────────────────
-// true  = only show products tagged ['t','bitsoko'] — African circular economy merchants
-// false = global Nostr marketplace (all kind:30402 events like Shopstr)
 export function getBitsokoOnly() {
   return localStorage.getItem('bitsoko_filter_mode') !== 'global'
 }
@@ -123,7 +122,6 @@ export async function fetchAndSeed({ onProduct, onProfile, onDone } = {}) {
   const relays = [...new Set([...getReadRelays(), ...DEFAULT_RELAYS])]
 
   try {
-    // Filter based on user preference — Bitsoko merchants only or global
     const bitsokoOnly = getBitsokoOnly()
     const listingFilter = bitsokoOnly
       ? { kinds: [KINDS.LISTING],       '#t': ['bitsoko'], limit: 500 }
@@ -256,18 +254,6 @@ async function fetchProfileIfMissing(pubkey) {
 
 // ─────────────────────────────────────────────
 // PUBLISH LISTING (kind:30402 — NIP-99)
-//
-// FIX 1 — Duplicate listing on edit:
-//   productId passed from MyShop is the stableId (pubkey:d-tag).
-//   Using that whole string as the d tag creates a NEW product.
-//   Fix: if productId looks like a stableId (contains ':'), extract
-//   just the d-tag portion after the first pubkey segment.
-//
-// FIX 2 — Category filter never matches:
-//   Was doing c.toLowerCase() on categories before tagging.
-//   db.js saveProduct reads t-tags back as-is into p.categories.
-//   Home/Explore filter against full-name strings like 'Electronics'.
-//   Fix: store categories exactly as provided — no lowercasing.
 // ─────────────────────────────────────────────
 export async function publishProduct({
   name,
@@ -280,7 +266,7 @@ export async function publishProduct({
   shipping     = [],
   location     = 'Nairobi, Kenya',
   status       = 'active',
-  productId    = null,   // stableId from db (pubkey:d-tag) or null for new
+  productId    = null,
   isDeal       = false,
   originalPrice = 0,
 }) {
@@ -288,16 +274,11 @@ export async function publishProduct({
   const pk  = getPublicKeyHex()
   const now = Math.floor(Date.now() / 1000)
 
-  // FIX 1: extract raw d-tag from stableId
-  // stableId format = "pubkeyHex:d-tag-value"
-  // pubkeyHex is always 64 hex chars, so split at char 65 (the colon)
   let dTag
   if (productId) {
     if (productId.length > 65 && productId[64] === ':') {
-      // It's a stableId — extract the d-tag portion after pubkey:
       dTag = productId.slice(65)
     } else {
-      // It's already a raw d-tag (legacy or manually set)
       dTag = productId
     }
   } else {
@@ -317,14 +298,11 @@ export async function publishProduct({
     ['quantity',     quantity.toString()],
     ['t',            'bitsoko'],
     ['t',            'bitcoin'],
-    // Deduplicate categories (case-insensitive) before tagging
-    // Prevents duplicate tags when editing a product multiple times
     ...([...new Set(categories.map(c => c.trim()).filter(Boolean))]).map(c => ['t', c]),
-    ...images.map(url      => ['image',    url]),
-    ...shipping.map(s      => ['shipping', s.name || '', (s.cost || 0).toString(), 'SATS', s.regions || '']),
+    ...images.map(url   => ['image',    url]),
+    ...shipping.map(s   => ['shipping', s.name || '', (s.cost || 0).toString(), 'SATS', s.regions || '']),
   ]
 
-  // Deal tags — adds to Deals page relay filter
   if (isDeal) {
     tags.push(['t', 'deal'])
     tags.push(['t', 'sale'])
@@ -373,7 +351,6 @@ export async function deleteProductEvent(productId) {
   const dTag   = (product.tags || []).find(t => t[0] === 'd')?.[1] || productId
   const relays = [...new Set([...getWriteRelays(), ...DEFAULT_RELAYS])]
 
-  // NIP-09 kind:5 deletion
   const kind5 = finalizeEvent({
     kind:       KINDS.DELETE,
     created_at: Math.floor(Date.now() / 1000),
@@ -382,7 +359,6 @@ export async function deleteProductEvent(productId) {
   }, sk)
   try { await Promise.any(getPool().publish(relays, kind5).map(p => p.catch(e => { throw e }))) } catch {}
 
-  // kind:30403 tombstone
   const tombstone = finalizeEvent({
     kind:       KINDS.LISTING_DRAFT,
     created_at: Math.floor(Date.now() / 1000) + 1,
@@ -402,10 +378,6 @@ export async function deleteProductEvent(productId) {
 
 // ─────────────────────────────────────────────
 // PUBLISH ORDER (kind:4 NIP-04 DM)
-//
-// FIX 3 — Human-readable order message
-// Was sending raw JSON that sellers couldn't read.
-// Now sends a clean text format buyers and sellers both understand.
 // ─────────────────────────────────────────────
 export async function publishOrder({ sellerPubkey, product, quantity, message = '' }) {
   const sk      = getSecretKey()
@@ -413,15 +385,16 @@ export async function publishOrder({ sellerPubkey, product, quantity, message = 
   const relays  = getWriteRelays()
   const buyer   = localStorage.getItem('bitsoko_display_name') || 'A buyer'
 
-  const satsToKsh = (sats) => {
-    const ksh = (sats / 100_000_000) * 13_000_000
-    return ksh >= 1000 ? `KSh ${(ksh/1000).toFixed(1)}k` : `KSh ${Math.round(ksh)}`
-  }
-
+  // Use live rate from rates.js — no more hardcoded 13_000_000
+  const rate      = getRate()
   const total     = product.price * quantity
-  const totalFiat = satsToKsh(total)
+  const ksh       = (total / 100_000_000) * rate
+  const totalFiat = ksh >= 1_000_000
+    ? `KSh ${(ksh / 1_000_000).toFixed(2)}M`
+    : ksh >= 1000
+    ? `KSh ${(ksh / 1000).toFixed(1)}k`
+    : `KSh ${Math.round(ksh)}`
 
-  // Human-readable order message — no JSON
   const orderText = [
     `🛒 New Order from Bitsoko`,
     ``,
@@ -446,16 +419,16 @@ export async function publishOrder({ sellerPubkey, product, quantity, message = 
   }, sk)
 
   await saveOrder({
-    id:           event.id,
-    pubkey:       pk,
+    id:            event.id,
+    pubkey:        pk,
     seller_pubkey: sellerPubkey,
-    product_id:   product.id,
-    product_name: product.name,
-    product:      product,
+    product_id:    product.id,
+    product_name:  product.name,
+    product:       product,
     quantity,
-    price:        total,
-    status:       'pending',
-    created_at:   event.created_at,
+    price:         total,
+    status:        'pending',
+    created_at:    event.created_at,
     message,
   })
 

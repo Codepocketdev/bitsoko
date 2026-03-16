@@ -7,6 +7,7 @@ import {
 } from 'lucide-react'
 import { getCart, updateCartQty, removeFromCart, clearCart } from '../lib/db'
 import { publishOrder } from '../lib/nostrSync'
+import { satsToKsh, useRate } from '../lib/rates'
 
 const C = {
   bg:     '#f7f4f0',
@@ -20,12 +21,6 @@ const C = {
   green:  '#22c55e',
 }
 
-function satsToKsh(sats) {
-  const ksh = (sats / 100_000_000) * 13_000_000
-  if (ksh >= 1000) return `KSh ${(ksh/1000).toFixed(1)}k`
-  return `KSh ${Math.round(ksh)}`
-}
-
 function CartItem({ item, onQtyChange, onRemove }) {
   const { product, quantity } = item
   const image = product.images?.[0]
@@ -33,7 +28,6 @@ function CartItem({ item, onQtyChange, onRemove }) {
 
   return (
     <div style={{ background: C.white, borderRadius: 14, border: `1px solid ${C.border}`, padding: 12, display: 'flex', gap: 12, alignItems: 'center' }}>
-      {/* Image */}
       <div style={{ width: 64, height: 64, borderRadius: 10, overflow: 'hidden', background: C.border, flexShrink: 0 }}>
         {image && !imgErr
           ? <img src={image} alt={product.name} onError={() => setImgErr(true)} loading="eager" decoding="async"
@@ -44,7 +38,6 @@ function CartItem({ item, onQtyChange, onRemove }) {
         }
       </div>
 
-      {/* Info */}
       <div style={{ flex: 1, minWidth: 0 }}>
         <div style={{ fontSize: 13, fontWeight: 700, color: C.black, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', marginBottom: 3 }}>
           {product.name || 'Untitled'}
@@ -54,7 +47,6 @@ function CartItem({ item, onQtyChange, onRemove }) {
           <span style={{ fontSize: 12, fontWeight: 700, color: C.black }}>{(product.price * quantity).toLocaleString()} sats</span>
           {quantity > 1 && <span style={{ fontSize: 10, color: C.muted }}>({product.price?.toLocaleString()} × {quantity})</span>}
         </div>
-        {/* Qty stepper */}
         <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
           <div style={{ display: 'flex', alignItems: 'center', border: `1px solid ${C.border}`, borderRadius: 8, overflow: 'hidden' }}>
             <button onClick={() => onQtyChange(quantity - 1)} style={{ width: 28, height: 28, background: C.bg, border: 'none', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 14, color: C.black }}>−</button>
@@ -64,7 +56,6 @@ function CartItem({ item, onQtyChange, onRemove }) {
         </div>
       </div>
 
-      {/* Remove */}
       <button onClick={onRemove} style={{ width: 32, height: 32, borderRadius: 8, background: 'rgba(239,68,68,0.06)', border: `1px solid rgba(239,68,68,0.15)`, display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer', flexShrink: 0 }}>
         <Trash2 size={14} color={C.red}/>
       </button>
@@ -74,11 +65,11 @@ function CartItem({ item, onQtyChange, onRemove }) {
 
 export default function Cart() {
   const navigate = useNavigate()
+  const rate     = useRate() // ← live BTC/KES rate
 
   const [items,       setItems]       = useState([])
   const [loading,     setLoading]     = useState(false)
-  const [placing,     setPlacing]     = useState(false)
-  const [orderStatus, setOrderStatus] = useState('idle') // idle | placing | done | error
+  const [orderStatus, setOrderStatus] = useState('idle')
   const [orderErr,    setOrderErr]    = useState('')
   const [message,     setMessage]     = useState('')
   const [showNote,    setShowNote]    = useState(false)
@@ -115,7 +106,6 @@ export default function Cart() {
     setOrderStatus('placing'); setOrderErr('')
 
     try {
-      // Group items by seller (one DM per seller with all their items)
       const bySeller = {}
       for (const item of items) {
         const pk = item.product.pubkey
@@ -123,10 +113,7 @@ export default function Cart() {
         bySeller[pk].push(item)
       }
 
-      // Send one order DM per unique seller
       for (const [sellerPubkey, sellerItems] of Object.entries(bySeller)) {
-        // Use the first product as the "main" product for the order DM
-        // Include all items in the message
         const itemsList = sellerItems.map(i =>
           `• ${i.product.name} × ${i.quantity} = ${(i.product.price * i.quantity).toLocaleString()} sats`
         ).join('\n')
@@ -158,8 +145,8 @@ export default function Cart() {
     }
   }
 
-  const totalSats  = items.reduce((s, i) => s + (i.product.price * i.quantity), 0)
-  const totalItems = items.reduce((s, i) => s + i.quantity, 0)
+  const totalSats   = items.reduce((s, i) => s + (i.product.price * i.quantity), 0)
+  const totalItems  = items.reduce((s, i) => s + i.quantity, 0)
   const sellerCount = new Set(items.map(i => i.product.pubkey)).size
 
   if (loading) {
@@ -216,7 +203,6 @@ export default function Cart() {
             />
           ))}
 
-          {/* Seller info */}
           <div style={{ background: C.white, borderRadius: 12, border: `1px solid ${C.border}`, padding: '12px 14px', display: 'flex', alignItems: 'center', gap: 8 }}>
             <Store size={14} color={C.ochre}/>
             <span style={{ fontSize: 12, color: C.muted }}>
@@ -224,7 +210,6 @@ export default function Cart() {
             </span>
           </div>
 
-          {/* Optional note */}
           <button onClick={() => setShowNote(s => !s)} style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: 12, color: C.ochre, textAlign: 'left', fontFamily: "'Inter',sans-serif", padding: '4px 0', display: 'flex', alignItems: 'center', gap: 4 }}>
             <MessageCircle size={13}/> {showNote ? 'Hide note' : 'Add note to sellers'}
           </button>
@@ -244,13 +229,12 @@ export default function Cart() {
       {items.length > 0 && (
         <div style={{ position: 'fixed', bottom: 64, left: 0, right: 0, background: C.white, borderTop: `1px solid ${C.border}`, padding: '16px 20px', boxShadow: '0 -4px 16px rgba(26,20,16,0.06)' }}>
 
-          {/* Total */}
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
             <span style={{ fontSize: 13, color: C.muted }}>Total</span>
             <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
               <Zap size={15} fill={C.orange} color={C.orange}/>
               <span style={{ fontSize: 18, fontWeight: 800, color: C.black }}>{totalSats.toLocaleString()}</span>
-              <span style={{ fontSize: 12, color: C.muted }}>sats · {satsToKsh(totalSats)}</span>
+              <span style={{ fontSize: 12, color: C.muted }}>sats · {satsToKsh(totalSats, rate)}</span>
             </div>
           </div>
 

@@ -6,6 +6,7 @@ import {
   MessageCircle, ChevronRight, ShoppingBag,
 } from 'lucide-react'
 import { getOrders } from '../lib/db'
+import { satsToKsh, useRate } from '../lib/rates'
 import { nip19 } from 'nostr-tools'
 
 const C = {
@@ -20,12 +21,6 @@ const C = {
   green:  '#22c55e',
 }
 
-function satsToKsh(sats) {
-  const ksh = (sats / 100_000_000) * 13_000_000
-  if (ksh >= 1000) return `KSh ${(ksh/1000).toFixed(1)}k`
-  return `KSh ${Math.round(ksh)}`
-}
-
 function timeAgo(ts) {
   const s = Math.floor(Date.now() / 1000) - ts
   if (s < 3600)  return `${Math.floor(s/60)}m ago`
@@ -35,11 +30,11 @@ function timeAgo(ts) {
 }
 
 const STATUS_CONFIG = {
-  pending:   { label: 'Pending',   color: C.ochre,  bg: 'rgba(200,134,10,0.08)',  border: 'rgba(200,134,10,0.2)',  icon: Clock       },
-  confirmed: { label: 'Confirmed', color: C.green,  bg: 'rgba(34,197,94,0.08)',   border: 'rgba(34,197,94,0.2)',   icon: CheckCircle },
-  shipped:   { label: 'Shipped',   color: '#3b82f6', bg: 'rgba(59,130,246,0.08)', border: 'rgba(59,130,246,0.2)',  icon: Truck       },
-  completed: { label: 'Completed', color: C.green,  bg: 'rgba(34,197,94,0.08)',   border: 'rgba(34,197,94,0.2)',   icon: CheckCircle },
-  cancelled: { label: 'Cancelled', color: C.red,    bg: 'rgba(239,68,68,0.08)',   border: 'rgba(239,68,68,0.2)',   icon: XCircle     },
+  pending:   { label: 'Pending',   color: C.ochre,   bg: 'rgba(200,134,10,0.08)',  border: 'rgba(200,134,10,0.2)',  icon: Clock       },
+  confirmed: { label: 'Confirmed', color: C.green,   bg: 'rgba(34,197,94,0.08)',   border: 'rgba(34,197,94,0.2)',   icon: CheckCircle },
+  shipped:   { label: 'Shipped',   color: '#3b82f6', bg: 'rgba(59,130,246,0.08)',  border: 'rgba(59,130,246,0.2)',  icon: Truck       },
+  completed: { label: 'Completed', color: C.green,   bg: 'rgba(34,197,94,0.08)',   border: 'rgba(34,197,94,0.2)',   icon: CheckCircle },
+  cancelled: { label: 'Cancelled', color: C.red,     bg: 'rgba(239,68,68,0.08)',   border: 'rgba(239,68,68,0.2)',   icon: XCircle     },
 }
 
 function StatusBadge({ status }) {
@@ -57,7 +52,7 @@ function StatusBadge({ status }) {
   )
 }
 
-function OrderCard({ order, onMessage }) {
+function OrderCard({ order, onMessage, rate }) {
   const [expanded, setExpanded] = useState(false)
 
   let sellerShort = ''
@@ -73,13 +68,11 @@ function OrderCard({ order, onMessage }) {
 
   return (
     <div style={{ background: C.white, borderRadius: 14, border: `1px solid ${C.border}`, overflow: 'hidden' }}>
-      {/* Header row */}
       <button onClick={() => setExpanded(s => !s)} style={{
         width: '100%', padding: '14px 16px', background: 'none', border: 'none',
         cursor: 'pointer', textAlign: 'left', display: 'flex', alignItems: 'center', gap: 12,
         borderBottom: expanded ? `1px solid ${C.border}` : 'none',
       }}>
-        {/* Product image or icon */}
         <div style={{ width: 44, height: 44, borderRadius: 10, overflow: 'hidden', background: C.border, flexShrink: 0 }}>
           {order.product?.images?.[0]
             ? <img src={order.product.images[0]} alt="" loading="eager" decoding="async"
@@ -106,21 +99,20 @@ function OrderCard({ order, onMessage }) {
             <Zap size={11} fill={C.orange} color={C.orange}/>
             <span style={{ fontSize: 13, fontWeight: 700, color: C.black }}>{total.toLocaleString()}</span>
           </div>
-          <div style={{ fontSize: 10, color: C.muted }}>{satsToKsh(total)}</div>
+          <div style={{ fontSize: 10, color: C.muted }}>{satsToKsh(total, rate)}</div>
         </div>
 
         <ChevronRight size={14} color={C.muted} style={{ transform: expanded ? 'rotate(90deg)' : 'none', transition: 'transform .2s', flexShrink: 0 }}/>
       </button>
 
-      {/* Expanded details */}
       {expanded && (
         <div style={{ padding: '14px 16px' }}>
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, marginBottom: 14 }}>
             {[
-              { label: 'Quantity',  value: `×${qty}` },
+              { label: 'Quantity',   value: `×${qty}` },
               { label: 'Unit price', value: `${price.toLocaleString()} sats` },
-              { label: 'Seller',    value: sellerShort },
-              { label: 'Order ID',  value: order.id?.slice(0, 8) + '…' },
+              { label: 'Seller',     value: sellerShort },
+              { label: 'Order ID',   value: order.id?.slice(0, 8) + '…' },
             ].map(({ label, value }) => (
               <div key={label} style={{ background: C.bg, borderRadius: 10, padding: '10px 12px' }}>
                 <div style={{ fontSize: 10, color: C.muted, marginBottom: 3 }}>{label}</div>
@@ -151,6 +143,8 @@ function OrderCard({ order, onMessage }) {
 
 export default function Orders() {
   const navigate = useNavigate()
+  const rate     = useRate() // ← live BTC/KES rate
+
   const [orders,  setOrders]  = useState([])
   const [loading, setLoading] = useState(true)
 
@@ -201,7 +195,7 @@ export default function Orders() {
         {!loading && orders.length > 0 && (
           <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
             {orders.map(order => (
-              <OrderCard key={order.id} order={order} onMessage={handleMessage}/>
+              <OrderCard key={order.id} order={order} onMessage={handleMessage} rate={rate}/>
             ))}
           </div>
         )}

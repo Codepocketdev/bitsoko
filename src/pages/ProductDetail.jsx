@@ -9,6 +9,7 @@ import {
 import { getProductById, getProfile, addToCart, saveProduct, saveProfile } from '../lib/db'
 import { publishOrder, getPool, getReadRelays, DEFAULT_RELAYS, KINDS } from '../lib/nostrSync'
 import { purchaseWithFeeSplit, getBalance } from '../lib/cashuWallet'
+import { satsToKsh, useRate } from '../lib/rates'
 import { nip19 } from 'nostr-tools'
 
 const C = {
@@ -22,12 +23,6 @@ const C = {
   terra:  '#b5451b',
   red:    '#ef4444',
   green:  '#22c55e',
-}
-
-function satsToKsh(sats) {
-  const ksh = (sats / 100_000_000) * 13_000_000
-  if (ksh >= 1000) return `KSh ${(ksh / 1000).toFixed(1)}k`
-  return `KSh ${Math.round(ksh)}`
 }
 
 function timeAgo(ts) {
@@ -63,6 +58,7 @@ function Avatar({ profile, pubkey, size = 40 }) {
 export default function ProductDetail() {
   const { id }   = useParams()
   const navigate = useNavigate()
+  const rate     = useRate() // ← live BTC/KES rate
 
   const [product,      setProduct]      = useState(null)
   const [profile,      setProfile]      = useState(null)
@@ -87,7 +83,6 @@ export default function ProductDetail() {
 
   const isMyProduct = product && myPubkey && product.pubkey === myPubkey
 
-  // ── Load product + profile ────────────────
   useEffect(() => {
     let mounted = true
     const load = async () => {
@@ -95,31 +90,25 @@ export default function ProductDetail() {
         const relays = [...new Set([...getReadRelays(), ...DEFAULT_RELAYS])]
         const pool   = getPool()
 
-        // ── Step 1: IndexedDB first (instant if cached) ──
         let p = await getProductById(id)
         if (p && mounted) {
           setProduct(p)
           setLoading(false)
         }
 
-        // ── Step 2: If not in IndexedDB, fetch from relay ──
-        // id = stableId = "pubkey:d-tag" for kind:30402
-        // Split to get pubkey and d-tag for the relay filter
         if (!p) {
           const parts  = id.split(':')
           const pubkey = parts[0]
-          const dTag   = parts.slice(1).join(':') // d-tag can contain colons
+          const dTag   = parts.slice(1).join(':')
 
           let fetchedEvents = []
           try {
-            // Try by pubkey + d-tag (fastest, most precise)
             if (pubkey && dTag) {
               fetchedEvents = await pool.querySync(
                 relays,
                 { kinds: [KINDS.LISTING], authors: [pubkey], '#d': [dTag], limit: 5 }
               )
             }
-            // Fallback: fetch by event id (for legacy ids)
             if (!fetchedEvents.length) {
               fetchedEvents = await pool.querySync(
                 relays,
@@ -131,7 +120,6 @@ export default function ProductDetail() {
           }
 
           if (fetchedEvents.length && mounted) {
-            // Take newest version
             fetchedEvents.sort((a, b) => b.created_at - a.created_at)
             await saveProduct(fetchedEvents[0])
             p = await getProductById(id)
@@ -139,14 +127,12 @@ export default function ProductDetail() {
           }
 
           if (mounted) setLoading(false)
-          if (!p) return // genuinely not found
+          if (!p) return
         }
 
-        // ── Step 3: Load seller profile from IndexedDB ──
         const cached = await getProfile(p.pubkey)
         if (cached && mounted) setProfile(cached)
 
-        // ── Step 4: Refresh profile from relay (querySync) ──
         try {
           const profileEvents = await pool.querySync(
             relays,
@@ -171,21 +157,14 @@ export default function ProductDetail() {
     return () => { mounted = false }
   }, [id])
 
-  // ── Buy Now state ───────────────────────────
-  const [buyStatus,  setBuyStatus]  = useState('idle') // idle|checking|paying|done|error|noLN|noFunds
-  const [buyErr,     setBuyErr]     = useState('')
+  const [buyStatus, setBuyStatus] = useState('idle')
+  const [buyErr,    setBuyErr]    = useState('')
 
   const handleBuyNow = async () => {
     if (!product || buyStatus === 'paying' || buyStatus === 'done') return
     setBuyStatus('checking'); setBuyErr('')
 
-    // Extract lud16 — check multiple field names
-    // profile may come from relay (lud16) or old storage (lightning, lud16)
     const sellerLud16 = profile?.lud16 || profile?.lightning || profile?.lud06
-
-    console.log('[bitsoko] Buy Now — profile:', JSON.stringify(profile))
-    console.log('[bitsoko] Buy Now — sellerLud16:', sellerLud16)
-    console.log('[bitsoko] Buy Now — balance:', getBalance(), 'price:', product.price * quantity)
 
     if (!sellerLud16) {
       setBuyStatus('noLN')
@@ -235,9 +214,6 @@ export default function ProductDetail() {
       setOrderStatus('error')
     }
   }
-
-  // Show buy status inline — find the area after action buttons
-  // (status displayed in the render below)
 
   const copyLink = () => {
     navigator.clipboard?.writeText(`${window.location.origin}/product/${id}`)
@@ -406,7 +382,7 @@ export default function ProductDetail() {
                 <span style={{ fontSize: '0.85rem', color: C.muted, fontFamily: "'Inter',sans-serif" }}>sats</span>
               </div>
               <div style={{ fontSize: '0.78rem', color: C.muted, fontFamily: "'Inter',sans-serif" }}>
-                ≈ {satsToKsh(product.price)}
+                ≈ {satsToKsh(product.price, rate)}
               </div>
             </div>
             <div style={{
@@ -598,7 +574,7 @@ export default function ProductDetail() {
                 <span style={{ fontSize: '0.95rem', fontWeight: 800, color: C.black }}>
                   {(product.price * quantity).toLocaleString()} sats
                 </span>
-                <span style={{ fontSize: '0.68rem', color: C.muted }}>≈ {satsToKsh(product.price * quantity)}</span>
+                <span style={{ fontSize: '0.68rem', color: C.muted }}>≈ {satsToKsh(product.price * quantity, rate)}</span>
               </div>
             </div>
             <textarea
@@ -631,8 +607,7 @@ export default function ProductDetail() {
               border: 'none', borderRadius: 14,
               cursor: orderStatus === 'sending' || orderStatus === 'done' ? 'not-allowed' : 'pointer',
               fontSize: '0.92rem', fontWeight: 700, color: C.white,
-              display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8,
-              transition: 'all .2s',
+              display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8, transition: 'all .2s',
             }}>
               {orderStatus === 'sending'
                 ? <><Loader size={16} style={{ animation: 'spin 1s linear infinite' }}/> Sending order…</>

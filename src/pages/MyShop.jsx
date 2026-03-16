@@ -8,6 +8,7 @@ import {
 } from 'lucide-react'
 import { getProductsByPubkey, saveProduct, getProfile } from '../lib/db'
 import { publishProduct, deleteProductEvent, getPool, getReadRelays, DEFAULT_RELAYS, KINDS, uploadImage } from '../lib/nostrSync'
+import { satsToKsh, useRate } from '../lib/rates'
 import { nip19 } from 'nostr-tools'
 
 const C = {
@@ -28,12 +29,6 @@ const CATEGORIES = [
   'Home & Living','Books','Music','Wellness',
   'Services','Collectibles','Sports','Other',
 ]
-
-function satsToKsh(sats) {
-  const ksh = (sats / 100_000_000) * 13_000_000
-  if (ksh >= 1000) return `KSh ${(ksh/1000).toFixed(1)}k`
-  return `KSh ${Math.round(ksh)}`
-}
 
 function getMyPubkeyHex() {
   try { return nip19.decode(localStorage.getItem('bitsoko_npub')).data } catch { return null }
@@ -76,7 +71,7 @@ function DeleteSheet({ product, onConfirm, onCancel, deleting }) {
 }
 
 // ── Edit sheet ────────────────────────────────
-function EditSheet({ product, onSave, onCancel }) {
+function EditSheet({ product, onSave, onCancel, rate }) {
   const [images,      setImages]      = useState(product.images      || [])
   const [name,        setName]        = useState(product.name        || '')
   const [description, setDescription] = useState(product.description || '')
@@ -85,10 +80,9 @@ function EditSheet({ product, onSave, onCancel }) {
   const [categories,  setCategories]  = useState(() => {
     const CATS = ['Electronics','Fashion','Food & Drinks','Art & Crafts','Home & Living','Books','Music','Wellness','Services','Collectibles','Sports','Other']
     const raw  = product.categories || []
-    // Normalize: match lowercase to proper case, deduplicate
     const normalized = raw
       .map(c => CATS.find(p => p.toLowerCase() === c.toLowerCase()) || c)
-      .filter((c, i, arr) => arr.indexOf(c) === i) // deduplicate
+      .filter((c, i, arr) => arr.indexOf(c) === i)
     return normalized
   })
   const [isDeal,       setIsDeal]       = useState(() => (product.tags||[]).some(t=>t[0]==='t'&&t[1]==='deal'))
@@ -97,8 +91,6 @@ function EditSheet({ product, onSave, onCancel }) {
     if (!origTag) return ''
     const orig = parseInt(origTag[1])
     const curr = product.price || 0
-    // orig is the was-price, curr is the sale price
-    // pct = how much was taken off the original
     if (orig > curr && orig > 0) return String(Math.round(((orig - curr) / orig) * 100))
     return ''
   })
@@ -109,7 +101,7 @@ function EditSheet({ product, onSave, onCancel }) {
   const [errMsg,    setErrMsg]    = useState('')
   const [activeTab, setActiveTab] = useState('details')
 
-  const ksh = price ? Math.round((parseInt(price)/100_000_000)*13_000_000) : 0
+  const ksh = price ? Math.round((parseInt(price)/100_000_000) * (rate || 13_000_000)) : 0
 
   const handleImageAdd = async (files) => {
     const arr = Array.from(files).slice(0, 4 - images.length)
@@ -118,9 +110,9 @@ function EditSheet({ product, onSave, onCancel }) {
     for (const file of arr) {
       if (!file.type.startsWith('image/')) continue
       try {
-          const url = await uploadImage(file)
-          setImages(prev => [...prev, url])
-        } catch { setErrMsg('Image upload failed') }
+        const url = await uploadImage(file)
+        setImages(prev => [...prev, url])
+      } catch { setErrMsg('Image upload failed') }
     }
     setUploading(false)
   }
@@ -129,7 +121,6 @@ function EditSheet({ product, onSave, onCancel }) {
     const turningOff = isDeal
     setIsDeal(d => !d)
     if (turningOff) {
-      // Restore original price when deal is turned off
       const origTag = (product.tags||[]).find(t=>t[0]==='original_price')
       if (origTag) setPrice(origTag[1])
       setDiscountPct('')
@@ -147,17 +138,15 @@ function EditSheet({ product, onSave, onCancel }) {
     if (!name.trim()) { setErrMsg('Name is required'); return }
     setSaving(true); setErrMsg('')
     try {
-      const discPct   = parseInt(discountPct)
-      const currPrice = parseInt(price)
-      // originalPrice = the was-price (current listing price before discount)
-      // salePrice     = currPrice * (1 - pct/100)
+      const discPct         = parseInt(discountPct)
+      const currPrice       = parseInt(price)
       const salePrice       = isDeal && discPct > 0 && discPct < 100
         ? Math.round(currPrice * (1 - discPct / 100))
         : currPrice
       const computedOriginal = isDeal && discPct > 0 && discPct < 100 ? currPrice : 0
       await onSave({ images, name, description, price: salePrice, quantity, categories, shipping, isDeal, originalPrice: computedOriginal })
       setSaved(true)
-      setTimeout(() => onCancel(), 1200) // auto-close after showing success
+      setTimeout(() => onCancel(), 1200)
     }
     catch (e) { setErrMsg(e.message||'Save failed'); setSaving(false) }
   }
@@ -190,8 +179,7 @@ function EditSheet({ product, onSave, onCancel }) {
               padding:'8px 18px',borderRadius:99,
               background:saved?C.muted:C.black,border:'none',
               cursor:saving||saved?'not-allowed':'pointer',fontSize:'0.78rem',fontWeight:700,color:C.white,
-              display:'flex',alignItems:'center',gap:6,
-              transition:'background 0.2s',
+              display:'flex',alignItems:'center',gap:6,transition:'background 0.2s',
             }}>
               {saving ? <><Loader size={13} style={{animation:'spin 1s linear infinite'}}/> Saving…</> : saved ? <><Check size={13}/> Saved!</> : 'Save changes'}
             </button>
@@ -297,7 +285,6 @@ function EditSheet({ product, onSave, onCancel }) {
                 <div style={{ fontSize:'0.68rem',color:C.muted,marginTop:6 }}>Unlimited for digital goods or services</div>
               </div>
 
-              {/* Mark as Deal */}
               <div style={{ marginTop:18,background:isDeal?'rgba(232,97,74,0.06)':C.white,border:`1.5px solid ${isDeal?'rgba(232,97,74,0.4)':C.border}`,borderRadius:14,padding:'14px 16px',display:'flex',alignItems:'center',gap:14,transition:'all 0.2s' }}>
                 <div style={{ flex:1 }}>
                   <div style={{ fontSize:13,fontWeight:700,color:C.black,marginBottom:3,display:'flex',alignItems:'center',gap:6 }}>
@@ -329,7 +316,7 @@ function EditSheet({ product, onSave, onCancel }) {
                         {Math.round(parseInt(price)*(1-parseInt(discountPct)/100)).toLocaleString()} sats
                       </strong></span>
                       <span style={{ color:'#e8614a' }}>
-                        (KSh {Math.round((Math.round(parseInt(price)*(1-parseInt(discountPct)/100))/100000000)*13000000).toLocaleString()})
+                        ({satsToKsh(Math.round(parseInt(price)*(1-parseInt(discountPct)/100)), rate)})
                       </span>
                     </div>
                   )}
@@ -377,20 +364,15 @@ function EditSheet({ product, onSave, onCancel }) {
 }
 
 // ── Product row ───────────────────────────────
-function ProductRow({ product, onEdit, onDelete, onView }) {
+function ProductRow({ product, onEdit, onDelete, onView, rate }) {
   const image = product.images?.[0]
   const [imgErr, setImgErr] = useState(false)
   return (
     <div style={{ background:C.white,borderRadius:14,border:`1px solid ${C.border}`,padding:'12px',display:'flex',gap:12,alignItems:'center' }}>
       <div style={{ width:60,height:60,borderRadius:10,overflow:'hidden',background:C.border,flexShrink:0 }}>
         {image && !imgErr
-          ? <img
-              src={image} alt={product.name}
-              onError={()=>setImgErr(true)}
-              loading="eager"
-              decoding="async"
-              style={{ width:'100%',height:'100%',objectFit:'cover',willChange:'transform' }}
-            />
+          ? <img src={image} alt={product.name} onError={()=>setImgErr(true)} loading="eager" decoding="async"
+              style={{ width:'100%',height:'100%',objectFit:'cover',willChange:'transform' }}/>
           : <div style={{ width:'100%',height:'100%',display:'flex',alignItems:'center',justifyContent:'center' }}>
               <Package size={22} color="rgba(26,20,16,0.2)"/>
             </div>
@@ -406,7 +388,7 @@ function ProductRow({ product, onEdit, onDelete, onView }) {
           )}
           <Zap size={11} fill={C.orange} color={C.orange}/>
           <span style={{ fontSize:'0.75rem',fontWeight:700,color:C.black }}>{product.price?.toLocaleString()} sats</span>
-          <span style={{ fontSize:'0.68rem',color:C.muted }}>· {satsToKsh(product.price)}</span>
+          <span style={{ fontSize:'0.68rem',color:C.muted }}>· {satsToKsh(product.price, rate)}</span>
         </div>
         <div style={{ fontSize:'0.65rem',color:C.muted }}>
           {product.quantity===-1?'Unlimited stock':`${product.quantity} left`}
@@ -432,6 +414,7 @@ function ProductRow({ product, onEdit, onDelete, onView }) {
 export default function MyShop() {
   const navigate  = useNavigate()
   const pubkeyHex = getMyPubkeyHex()
+  const rate      = useRate() // ← live BTC/KES rate
 
   const [products,    setProducts]    = useState([])
   const [profile,     setProfile]     = useState(null)
@@ -448,7 +431,6 @@ export default function MyShop() {
     const load = async () => {
       if (!pubkeyHex) { setLoading(false); return }
 
-      // Step 1: IndexedDB — instant
       const [cached, prof] = await Promise.all([
         getProductsByPubkey(pubkeyHex),
         getProfile(pubkeyHex),
@@ -459,7 +441,6 @@ export default function MyShop() {
         setLoading(false)
       }
 
-      // Step 2: Relay refresh — always runs, fills in cleared-data gaps
       try {
         const relays = [...new Set([...getReadRelays(), ...DEFAULT_RELAYS])]
         const events = await getPool().querySync(relays, { kinds:[KINDS.LISTING], authors:[pubkeyHex], limit:500 })
@@ -554,7 +535,7 @@ export default function MyShop() {
               <Zap size={14} fill={C.orange} color={C.orange}/>
               <span style={{ fontSize:'1.1rem',fontWeight:800,color:C.black }}>{totalSats.toLocaleString()}</span>
             </div>
-            <div style={{ fontSize:'0.65rem',color:C.muted,marginTop:2 }}>{satsToKsh(totalSats)}</div>
+            <div style={{ fontSize:'0.65rem',color:C.muted,marginTop:2 }}>{satsToKsh(totalSats, rate)}</div>
           </div>
         </div>
 
@@ -582,13 +563,14 @@ export default function MyShop() {
                 onView  ={()=>navigate(`/product/${p.id}`)}
                 onEdit  ={()=>setEditProduct(p)}
                 onDelete={()=>setDelProduct(p)}
+                rate={rate}
               />
             ))}
           </div>
         )}
       </div>
 
-      {editProduct && <EditSheet product={editProduct} onSave={handleSaveEdit} onCancel={()=>setEditProduct(null)}/>}
+      {editProduct && <EditSheet product={editProduct} onSave={handleSaveEdit} onCancel={()=>setEditProduct(null)} rate={rate}/>}
       {delProduct  && <DeleteSheet product={delProduct} onConfirm={handleDelete} onCancel={()=>setDelProduct(null)} deleting={deleting}/>}
 
       {toast && (

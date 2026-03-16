@@ -1,23 +1,4 @@
 // Explore.jsx
-// ─────────────────────────────────────────────
-// Data pattern:
-//   1. openDB() → getProducts() from IndexedDB instantly
-//   2. fetchAndSeed() — relay batch fetch (debounced re-render)
-//   3. startSync()   — live WebSocket for new listings (direct state update)
-//   4. stopSync()    — cleanup on unmount
-//
-// FIX 1: onProduct during fetchAndSeed was calling getProducts(500)
-//         on every single event — hammers IndexedDB + causes dozens of
-//         re-renders per second. Now debounced: DB read fires max once
-//         per 300ms during the seed batch.
-//
-// FIX 2: startSync onProduct now updates state directly instead of
-//         doing a full DB round-trip on every live event.
-//
-// FIX 3: Removed duplicate category pill from sticky header —
-//         the horizontal scroll below already shows the active category.
-// ─────────────────────────────────────────────
-
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { useNavigate } from 'react-router-dom'
 import {
@@ -26,6 +7,7 @@ import {
 } from 'lucide-react'
 import { openDB, getProducts, getProfile, getProfiles, saveProduct } from '../lib/db'
 import { fetchAndSeed, startSync, stopSync } from '../lib/nostrSync'
+import { satsToKsh, useRate } from '../lib/rates'
 
 const C = {
   bg:     '#f7f4f0',
@@ -52,16 +34,10 @@ const SORT_OPTIONS = [
 ]
 
 const PAGE_SIZE   = 20
-const DEBOUNCE_MS = 300  // max one DB read per 300ms during seed
-
-function satsToKsh(sats) {
-  const ksh = (sats / 100_000_000) * 13_000_000
-  if (ksh >= 1000) return `KSh ${(ksh/1000).toFixed(1)}k`
-  return `KSh ${Math.round(ksh)}`
-}
+const DEBOUNCE_MS = 300
 
 // ── Product card ──────────────────────────────
-function ProductCard({ product, profile, onClick }) {
+function ProductCard({ product, profile, onClick, rate }) {
   const image      = product.images?.[0]
   const [imgErr, setImgErr] = useState(false)
   const sellerName = profile?.display_name || profile?.name || product.pubkey?.slice(0,8) + '…'
@@ -104,7 +80,7 @@ function ProductCard({ product, profile, onClick }) {
           {sellerName}
         </div>
         <div style={{ fontSize: 11, color: C.muted, marginTop: 2 }}>
-          {satsToKsh(product.price)}
+          {satsToKsh(product.price, rate)}
         </div>
       </div>
     </div>
@@ -143,7 +119,7 @@ function SortSheet({ current, onSelect, onClose }) {
 }
 
 // ── Filter sheet ──────────────────────────────
-function FilterSheet({ selectedCat, priceMax, onApply, onClose }) {
+function FilterSheet({ selectedCat, priceMax, onApply, onClose, rate }) {
   const [cat,   setCat]   = useState(selectedCat)
   const [price, setPrice] = useState(priceMax || '')
 
@@ -204,7 +180,7 @@ function FilterSheet({ selectedCat, priceMax, onApply, onClose }) {
                 }}
               />
             </div>
-            {price && <div style={{ fontSize: 11, color: C.muted, marginTop: 6 }}>≈ {satsToKsh(parseInt(price))}</div>}
+            {price && <div style={{ fontSize: 11, color: C.muted, marginTop: 6 }}>≈ {satsToKsh(parseInt(price), rate)}</div>}
           </div>
         </div>
 
@@ -225,6 +201,7 @@ function FilterSheet({ selectedCat, priceMax, onApply, onClose }) {
 // ── Main ──────────────────────────────────────
 export default function Explore() {
   const navigate = useNavigate()
+  const rate     = useRate() // ← live BTC/KES rate
 
   const [products,     setProducts]     = useState([])
   const [profiles,     setProfiles]     = useState({})
@@ -238,21 +215,16 @@ export default function Explore() {
   const [showSort,     setShowSort]     = useState(false)
   const [showFilter,   setShowFilter]   = useState(false)
 
-  // Debounce ref — prevents hammering DB during relay seed batch
   const debounceTimer = useRef(null)
   const searchRef     = useRef(null)
 
-  // Reset pagination on any filter/sort change
   useEffect(() => { setVisibleCount(PAGE_SIZE) }, [search, selectedCat, priceMax, sortKey])
 
-  // ── Debounced DB reload ───────────────────────
-  // Collapses rapid-fire onProduct events (during seed) into one DB read
   const debouncedReload = useCallback(async () => {
     if (debounceTimer.current) clearTimeout(debounceTimer.current)
     debounceTimer.current = setTimeout(async () => {
       const updated = await getProducts(500)
       setProducts(updated)
-      // Batch-load any missing profiles
       const pubkeys = [...new Set(updated.map(p => p.pubkey).filter(Boolean))]
       const profs   = await getProfiles(pubkeys)
       const profMap = {}
@@ -261,7 +233,6 @@ export default function Explore() {
     }, DEBOUNCE_MS)
   }, [])
 
-  // ── Step 1: IndexedDB instant load ───────────
   const loadFromDB = useCallback(async () => {
     await openDB()
     const saved = await getProducts(500)
@@ -276,22 +247,15 @@ export default function Explore() {
     }
   }, [])
 
-  // ── Steps 2 + 3: fetchAndSeed → startSync ────
   useEffect(() => {
     let mounted = true
 
     const init = async () => {
       await loadFromDB()
-
       setSyncing(true)
 
       await fetchAndSeed({
-        // FIX: was calling getProducts(500) on every event — now debounced
-        // so DB read fires at most once per 300ms during the batch
-        onProduct: async () => {
-          if (!mounted) return
-          debouncedReload()
-        },
+        onProduct: async () => { if (mounted) debouncedReload() },
         onProfile: (event) => {
           if (!mounted) return
           try {
@@ -303,27 +267,20 @@ export default function Explore() {
           if (!mounted) return
           setSyncing(false)
           setLoading(false)
-          // Final clean reload after seed completes
           getProducts(500).then(all => { if (mounted) setProducts(all) })
         },
       })
 
       startSync({
-        // FIX: was doing a full DB round-trip on every live event.
-        // Now updates state directly — DB write already happened in nostrSync.
         onProduct: async (event) => {
           if (!mounted) return
-
           if (event._deleted) {
             setProducts(prev => prev.filter(p => p.id !== event.id && p.event_id !== event.id))
             return
           }
-
-          // Merge new/updated product directly into state
           setProducts(prev => {
             const existing = prev.findIndex(p => p.id === event.id)
             if (existing >= 0) {
-              // Replace if newer
               if (event.created_at >= prev[existing].created_at) {
                 const next = [...prev]
                 next[existing] = event
@@ -333,8 +290,6 @@ export default function Explore() {
             }
             return [event, ...prev]
           })
-
-          // Load profile for this seller if we don't have it
           const prof = await getProfile(event.pubkey)
           if (prof && mounted) setProfiles(prev => ({ ...prev, [event.pubkey]: prof }))
         },
@@ -356,20 +311,11 @@ export default function Explore() {
     }
   }, [])
 
-  // ── Filter + sort ─────────────────────────────
   const filtered = products.filter(p => {
-    // Use parsed fields from db.js — NOT raw p.tags which are Nostr event tag arrays
-    // p.categories = already-parsed ['t', ...] tags (db.js saveProduct)
-    // p.status     = already-parsed status tag
     if (p.status === 'deleted') return false
-
-    // Check raw tags only for the 't':'deleted' signal (NIP-09 soft delete)
     const tTags = (p.tags || []).filter(t => t[0] === 't').map(t => t[1] || '')
     if (tTags.includes('deleted')) return false
-
-    // Category filter — use p.categories (already parsed, RESERVED words stripped)
     if (selectedCat && !(p.categories || []).includes(selectedCat)) return false
-
     if (priceMax != null && p.price > priceMax) return false
     if (search) {
       const q = search.toLowerCase()
@@ -386,8 +332,8 @@ export default function Explore() {
     return 0
   })
 
-  const visible          = sorted.slice(0, visibleCount)
-  const hasFilters       = selectedCat || priceMax != null
+  const visible           = sorted.slice(0, visibleCount)
+  const hasFilters        = selectedCat || priceMax != null
   const activeFilterCount = (selectedCat ? 1 : 0) + (priceMax != null ? 1 : 0)
 
   return (
@@ -401,7 +347,6 @@ export default function Explore() {
         padding: '12px 16px',
         display: 'flex', flexDirection: 'column', gap: 10,
       }}>
-        {/* Search bar */}
         <div style={{ position: 'relative', display: 'flex', alignItems: 'center' }}>
           <Search size={16} color={C.muted} style={{ position: 'absolute', left: 12, pointerEvents: 'none' }}/>
           <input
@@ -424,7 +369,6 @@ export default function Explore() {
           )}
         </div>
 
-        {/* Sort + Filter row */}
         <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
           <button onClick={() => setShowSort(true)} style={{
             display: 'flex', alignItems: 'center', gap: 5,
@@ -459,7 +403,6 @@ export default function Explore() {
             )}
           </button>
 
-          {/* Result count + sync indicator */}
           <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 5 }}>
             {syncing && <Loader size={12} color={C.ochre} style={{ animation: 'spin 1s linear infinite' }}/>}
             <span style={{ fontSize: 11, color: C.muted }}>
@@ -469,9 +412,7 @@ export default function Explore() {
         </div>
       </div>
 
-      {/* Category horizontal scroll
-          FIX: removed the duplicate active-category pill that was in the
-          sticky header — this scroll already shows which is selected */}
+      {/* Category horizontal scroll */}
       <div style={{ overflowX: 'auto', padding: '12px 16px 0', display: 'flex', gap: 8, scrollbarWidth: 'none' }}>
         <button onClick={() => setSelectedCat('')} style={{
           flexShrink: 0, padding: '7px 16px', borderRadius: 99,
@@ -536,6 +477,7 @@ export default function Explore() {
                   product={p}
                   profile={profiles[p.pubkey]}
                   onClick={() => navigate(`/product/${p.id}`)}
+                  rate={rate}
                 />
               ))}
             </div>
@@ -567,6 +509,7 @@ export default function Explore() {
           priceMax={priceMax}
           onApply={({ cat, priceMax: pm }) => { setSelectedCat(cat); setPriceMax(pm) }}
           onClose={() => setShowFilter(false)}
+          rate={rate}
         />
       )}
 

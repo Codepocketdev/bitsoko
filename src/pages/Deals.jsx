@@ -1,18 +1,4 @@
 // Deals.jsx
-// ─────────────────────────────────────────────
-// Deals = products sellers have intentionally marked
-// with t:sale or t:deal tags on their kind:30402 events.
-//
-// This is NOT a price algorithm — it's seller intent.
-// A seller marks something as a deal when they want to
-// move it fast: excess stock, promo launch, limited time.
-//
-// Data: always fetched from relay with
-//   { kinds:[30402], '#t':['sale','deal'] }
-// No IndexedDB dependency — works after clearing data.
-// Also saves to IndexedDB as a side effect.
-// ─────────────────────────────────────────────
-
 import { useState, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
 import {
@@ -24,6 +10,7 @@ import {
 } from 'lucide-react'
 import { getPool, getReadRelays, DEFAULT_RELAYS, KINDS } from '../lib/nostrSync'
 import { getProfile, saveProfile, saveProduct } from '../lib/db'
+import { satsToKsh, useRate } from '../lib/rates'
 
 const C = {
   bg:     '#f7f4f0',
@@ -36,7 +23,7 @@ const C = {
   terra:  '#b5451b',
   red:    '#ef4444',
   green:  '#22c55e',
-  deal:   '#e8614a', // deal badge color
+  deal:   '#e8614a',
 }
 
 const CATEGORIES = [
@@ -58,13 +45,6 @@ const SORT_OPTIONS = [
 
 const PAGE_SIZE = 20
 
-function satsToKsh(sats) {
-  const ksh = (sats / 100_000_000) * 13_000_000
-  if (ksh >= 1000) return `KSh ${(ksh/1000).toFixed(1)}k`
-  return `KSh ${Math.round(ksh)}`
-}
-
-// Parse raw kind:30402 event into product object
 function parseEvent(event) {
   const tags   = event.tags || []
   const tag    = (name) => tags.find(t => t[0] === name)?.[1] || ''
@@ -80,8 +60,6 @@ function parseEvent(event) {
   const categories    = tagAll('t').map(t=>t[1]).filter(v => v && !RESERVED.has(v))
   const images        = tagAll('image').map(t=>t[1]).filter(Boolean)
 
-  // Original price tag — sellers set this to show discount
-  // e.g. ['original_price', '100000', 'SATS']
   const origTag       = tags.find(t => t[0] === 'original_price')
   const originalPrice = origTag ? parseInt(origTag[1]) || 0 : 0
   const discount      = originalPrice > price && originalPrice > 0
@@ -119,7 +97,7 @@ function Avatar({ profile, pubkey, size = 28 }) {
   )
 }
 
-function DealCard({ product, profile, onClick }) {
+function DealCard({ product, profile, onClick, rate }) {
   const image      = product.images?.[0]
   const [imgErr, setImgErr] = useState(false)
   const sellerName = profile?.display_name || profile?.name || product.pubkey?.slice(0,8) + '…'
@@ -130,7 +108,6 @@ function DealCard({ product, profile, onClick }) {
       border: `1px solid ${C.border}`, overflow: 'hidden',
       cursor: 'pointer', position: 'relative',
     }}>
-      {/* Deal badge — shows discount % if available, else just DEAL */}
       <div style={{
         position: 'absolute', top: 8, right: 8, zIndex: 2,
         background: C.deal, borderRadius: 99,
@@ -141,7 +118,6 @@ function DealCard({ product, profile, onClick }) {
         {product.discount > 0 ? `-${product.discount}%` : 'DEAL'}
       </div>
 
-      {/* Image */}
       <div style={{ aspectRatio: '1', background: C.bg, overflow: 'hidden', position: 'relative' }}>
         {image && !imgErr
           ? <img src={image} alt={product.name}
@@ -152,7 +128,6 @@ function DealCard({ product, profile, onClick }) {
               <Package size={28} color="rgba(26,20,16,0.12)"/>
             </div>
         }
-        {/* Price badge */}
         <div style={{
           position: 'absolute', bottom: 8, left: 8,
           background: 'rgba(26,20,16,0.85)', backdropFilter: 'blur(4px)',
@@ -166,7 +141,6 @@ function DealCard({ product, profile, onClick }) {
         </div>
       </div>
 
-      {/* Info */}
       <div style={{ padding: '10px 12px 12px' }}>
         <div style={{ fontSize:13, fontWeight:600, color:C.black, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap', marginBottom:2 }}>
           {product.name || 'Untitled'}
@@ -181,7 +155,7 @@ function DealCard({ product, profile, onClick }) {
             <Zap size={10} fill={C.orange} color={C.orange}/>
             <span style={{ fontSize:12,fontWeight:700,color:C.black }}>{product.price?.toLocaleString()} sats</span>
           </div>
-          <div style={{ fontSize:10,color:C.muted }}>{satsToKsh(product.price)}</div>
+          <div style={{ fontSize:10,color:C.muted }}>{satsToKsh(product.price, rate)}</div>
         </div>
         <div style={{ display:'flex', alignItems:'center', gap:5 }}>
           <Avatar profile={profile} pubkey={product.pubkey} size={16}/>
@@ -227,6 +201,7 @@ function SortSheet({ current, onSelect, onClose }) {
 
 export default function Deals() {
   const navigate = useNavigate()
+  const rate     = useRate() // ← live BTC/KES rate
 
   const [products,     setProducts]     = useState([])
   const [profiles,     setProfiles]     = useState({})
@@ -239,22 +214,17 @@ export default function Deals() {
 
   useEffect(() => { setVisibleCount(PAGE_SIZE) }, [selectedCat, sortKey])
 
-  // ── Fetch deals from relay ────────────────
-  // Relay-first — no IndexedDB dependency.
-  // Queries both t:sale and t:deal tags in parallel.
   const fetchDeals = async () => {
     setLoading(true)
     try {
       const relays = [...new Set([...getReadRelays(), ...DEFAULT_RELAYS])]
       const pool   = getPool()
 
-      // Fetch both sale and deal tagged products in parallel
       const [saleEvents, dealEvents] = await Promise.all([
         pool.querySync(relays, { kinds: [KINDS.LISTING], '#t': ['sale'],  limit: 500 }),
         pool.querySync(relays, { kinds: [KINDS.LISTING], '#t': ['deal'],  limit: 500 }),
       ])
 
-      // Merge and deduplicate by stableId
       const all = [...saleEvents, ...dealEvents]
       const map  = new Map()
       for (const e of all) {
@@ -264,12 +234,10 @@ export default function Deals() {
         if (!ex || e.created_at >= ex.created_at) map.set(key, e)
       }
 
-      // Parse and filter out deleted
       const parsed = Array.from(map.values())
         .map(parseEvent)
         .filter(p => p.status !== 'deleted')
 
-      // Save to IndexedDB as side effect
       for (const e of map.values()) {
         try { await saveProduct(e) } catch {}
       }
@@ -277,14 +245,12 @@ export default function Deals() {
       setProducts(parsed)
       setLastFetch(new Date())
 
-      // Load profiles
       const pubkeys = [...new Set(parsed.map(p => p.pubkey))]
       const profMap = { ...profiles }
 
       for (const pk of pubkeys) {
         const cached = await getProfile(pk)
         if (cached) { profMap[pk] = cached; continue }
-        // Fetch missing profiles in background
         pool.querySync(relays, { kinds: [0], authors: [pk], limit: 1 })
           .then(events => {
             if (events.length) {
@@ -304,7 +270,6 @@ export default function Deals() {
 
   useEffect(() => { fetchDeals() }, [])
 
-  // ── Filter + sort ─────────────────────────
   const filtered = products.filter(p => {
     if (!selectedCat) return true
     return (p.categories || []).includes(selectedCat)
@@ -355,7 +320,6 @@ export default function Deals() {
           </div>
         </div>
 
-        {/* Sort + category row */}
         <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
           <button onClick={() => setShowSort(true)} style={{
             display: 'flex', alignItems: 'center', gap: 5,
@@ -396,7 +360,6 @@ export default function Deals() {
 
       <div style={{ padding: '16px' }}>
 
-        {/* Loading */}
         {loading && (
           <div style={{ display:'flex', flexDirection:'column', alignItems:'center', justifyContent:'center', padding:'64px 0', gap:12 }}>
             <Loader size={26} color={C.ochre} style={{ animation:'spin 1s linear infinite' }}/>
@@ -404,7 +367,6 @@ export default function Deals() {
           </div>
         )}
 
-        {/* No deals */}
         {!loading && sorted.length === 0 && (
           <div style={{ display:'flex', flexDirection:'column', alignItems:'center', justifyContent:'center', padding:'48px 20px', gap:14, textAlign:'center' }}>
             <Tag size={44} color={C.border}/>
@@ -412,14 +374,9 @@ export default function Deals() {
             <div style={{ fontSize:'0.82rem', color:C.muted, lineHeight:1.6, maxWidth:280 }}>
               Sellers can mark their listings as deals when creating or editing a product. Check back soon.
             </div>
-
-            <div style={{ fontSize:12, color:C.muted, lineHeight:1.6, maxWidth:280, textAlign:'center' }}>
-              Mark a listing as a deal when creating or editing a product to feature it here.
-            </div>
           </div>
         )}
 
-        {/* Deals grid */}
         {!loading && visible.length > 0 && (
           <>
             <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:12 }}>
@@ -429,6 +386,7 @@ export default function Deals() {
                   product={p}
                   profile={profiles[p.pubkey]}
                   onClick={() => navigate(`/product/${p.id}`)}
+                  rate={rate}
                 />
               ))}
             </div>
@@ -446,8 +404,6 @@ export default function Deals() {
             )}
           </>
         )}
-
-
       </div>
 
       {showSort && (

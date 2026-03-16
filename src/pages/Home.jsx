@@ -9,6 +9,7 @@ import {
 import { openDB, getProducts, getProfile, getProfiles } from '../lib/db'
 import { fetchAndSeed, startSync, stopSync, getPublicKeyHex } from '../lib/nostrSync'
 import { useNostrProfile } from '../hooks/useNostrProfile'
+import { satsToKsh, useRate } from '../lib/rates'
 
 const C = {
   bg:     '#f7f4f0',
@@ -22,8 +23,6 @@ const C = {
   sage:   '#2d6a4f',
 }
 
-// FIX: tag values now match p.categories exactly (full names from db.js saveProduct)
-// Old tags were lowercase short ('electronics', 'food') — never matched p.categories
 const CATEGORIES = [
   { icon: Smartphone, label: 'Electronics',  tag: 'Electronics'   },
   { icon: Shirt,      label: 'Fashion',      tag: 'Fashion'       },
@@ -37,12 +36,6 @@ const CATEGORIES = [
 
 const PAGE_SIZE   = 20
 const DEBOUNCE_MS = 300
-
-function satsToKsh(sats) {
-  const ksh = (sats / 100_000_000) * 13_000_000
-  if (ksh >= 1000) return `KSh ${(ksh / 1000).toFixed(1)}k`
-  return `KSh ${Math.round(ksh)}`
-}
 
 function timeAgo(ts) {
   const s = Math.floor(Date.now() / 1000) - ts
@@ -74,12 +67,12 @@ function Avatar({ profile, pubkey, size = 36 }) {
   )
 }
 
-function ProductCard({ product, profile, onClick }) {
+function ProductCard({ product, profile, onClick, rate }) {
   const image      = product.images?.[0]
   const name       = product.name  || 'Untitled'
   const price      = product.price || 0
   const sellerName = profile?.name || profile?.display_name || product.pubkey?.slice(0, 8) + '…'
-  const [imgErr,   setImgErr] = useState(false)
+  const [imgErr, setImgErr] = useState(false)
 
   return (
     <div onClick={onClick} style={{
@@ -118,7 +111,7 @@ function ProductCard({ product, profile, onClick }) {
           {name}
         </div>
         <div style={{ fontFamily: "'Inter',sans-serif", fontSize: 11, color: C.muted, marginBottom: 6 }}>
-          {satsToKsh(price)}
+          {satsToKsh(price, rate)}
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
           <Avatar profile={profile} pubkey={product.pubkey} size={16}/>
@@ -133,6 +126,7 @@ function ProductCard({ product, profile, onClick }) {
 
 export default function Home() {
   const navigate = useNavigate()
+  const rate     = useRate() // ← live BTC/KES rate
 
   const [products,     setProducts]     = useState([])
   const [profiles,     setProfiles]     = useState({})
@@ -172,10 +166,8 @@ export default function Home() {
     return () => window.removeEventListener('bitsoko_login', onLogin)
   }, [])
 
-  // Reset pagination when filter/search changes
   useEffect(() => { setVisibleCount(PAGE_SIZE) }, [selectedCat, searchQuery])
 
-  // ── Debounced DB reload ───────────────────
   const debouncedReload = useCallback(async () => {
     if (debounceTimer.current) clearTimeout(debounceTimer.current)
     debounceTimer.current = setTimeout(async () => {
@@ -189,7 +181,6 @@ export default function Home() {
     }, DEBOUNCE_MS)
   }, [])
 
-  // ── Banners ───────────────────────────────
   const BANNERS = [
     { bg: '#e8614a', accent: '#fdf0e8', tag: 'LIGHTNING DEALS',   title: 'Pay with sats,\npay in seconds',       cta: 'Browse deals',  path: '/deals',          bubble: 'rgba(253,240,232,0.15)' },
     { bg: '#f5a623', accent: '#1a1410', tag: 'BITCOIN PAYMENTS',  title: 'Your storefront.\nOn Bitcoin rails.',   cta: 'Start selling', path: '/create-listing', bubble: 'rgba(26,20,16,0.08)'   },
@@ -203,7 +194,6 @@ export default function Home() {
     return () => clearInterval(t)
   }, [])
 
-  // ── Load from IndexedDB first ─────────────
   const loadFromDB = useCallback(async () => {
     await openDB()
     const saved = await getProducts(500)
@@ -218,7 +208,6 @@ export default function Home() {
     }
   }, [])
 
-  // ── Seed + live sync ──────────────────────
   useEffect(() => {
     let mounted = true
 
@@ -227,7 +216,6 @@ export default function Home() {
       setSyncing(true)
 
       await fetchAndSeed({
-        // FIX: debounced — was calling getProducts on every event, dozens per second during seed
         onProduct: () => { if (mounted) debouncedReload() },
         onProfile: (event) => {
           if (!mounted) return
@@ -245,7 +233,6 @@ export default function Home() {
       })
 
       startSync({
-        // FIX: direct state update — no DB round-trip on every live event
         onProduct: async (event) => {
           if (!mounted) return
           if (event._deleted) {
@@ -284,13 +271,10 @@ export default function Home() {
     }
   }, [])
 
-  // ── Filter ────────────────────────────────
-  // FIX: was using raw p.tags array — now uses p.categories (parsed by db.js saveProduct)
   const filtered = products.filter(p => {
     if (p.deleted || p.status === 'deleted') return false
     const tTags = (p.tags || []).filter(t => t[0] === 't').map(t => t[1] || '')
     if (tTags.includes('deleted')) return false
-    // p.categories = already-parsed category names (e.g. 'Electronics', 'Food & Drinks')
     if (selectedCat && !(p.categories || []).includes(selectedCat)) return false
     if (searchQuery) {
       const q = searchQuery.toLowerCase()
@@ -503,11 +487,11 @@ export default function Home() {
                   product={product}
                   profile={profiles[product.pubkey]}
                   onClick={() => navigate(`/product/${product.id}`)}
+                  rate={rate}
                 />
               ))}
             </div>
 
-            {/* Load more */}
             {visibleCount < sorted.length && (
               <button onClick={() => setVisibleCount(c => c + PAGE_SIZE)} style={{
                 width: '100%', marginTop: 16, padding: 14,
