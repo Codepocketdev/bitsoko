@@ -5,7 +5,8 @@ import {
   LogOut, ChevronRight, Shield, Zap, Info,
   Copy, Check, RefreshCw, Github,
 } from 'lucide-react'
-import { DEFAULT_RELAYS } from '../lib/nostrSync'
+import { DEFAULT_RELAYS, getSecretKey, getPublicKeyHex, getPool, getWriteRelays, getBitsokoOnly, setBitsokoOnly } from '../lib/nostrSync'
+import { finalizeEvent } from 'nostr-tools/pure'
 import { openDB } from '../lib/db'
 
 const C = {
@@ -34,6 +35,10 @@ function SectionLabel({ label }) {
 export default function Settings() {
   const navigate = useNavigate()
 
+  const [bitsokoOnly, setBitsokoOnlyState] = useState(() => getBitsokoOnly())
+  const [lnAddress,  setLnAddress]  = useState(() => localStorage.getItem('bitsoko_ln') || '')
+  const [lnSaving,   setLnSaving]   = useState(false)
+  const [lnSaved,    setLnSaved]    = useState(false)
   const [copied,     setCopied]     = useState(false)
   const [clearing,   setClearing]   = useState(false)
   const [clearDone,  setClearDone]  = useState(false)
@@ -42,6 +47,40 @@ export default function Settings() {
 
   const npub      = localStorage.getItem('bitsoko_npub') || ''
   const shortNpub = npub ? `${npub.slice(0,12)}…${npub.slice(-6)}` : 'Not set'
+
+  const toggleMarketplace = (val) => {
+    setBitsokoOnly(val)
+    setBitsokoOnlyState(val)
+    // Clear cache so it re-fetches with new filter
+    localStorage.removeItem('bitsoko_products_cache')
+  }
+
+  const saveLnAddress = async () => {
+    const addr = lnAddress.trim()
+    if (!addr) return
+    setLnSaving(true)
+    try {
+      const sk = getSecretKey()
+      const pk = getPublicKeyHex()
+      // Read existing kind:0 profile from localStorage
+      const existing = JSON.parse(localStorage.getItem('bitsoko_profile') || '{}')
+      const updated  = { ...existing, lud16: addr, lightning: addr }
+      // Publish updated kind:0 to relays
+      const event = finalizeEvent({
+        kind:       0,
+        created_at: Math.floor(Date.now() / 1000),
+        tags:       [],
+        content:    JSON.stringify(updated),
+      }, sk)
+      const relays = [...new Set([...getWriteRelays()])]
+      await Promise.any(getPool().publish(relays, event).map(p => p.catch(e => { throw e })))
+      localStorage.setItem('bitsoko_ln', addr)
+      localStorage.setItem('bitsoko_profile', JSON.stringify(updated))
+      setLnSaved(true)
+      setTimeout(() => setLnSaved(false), 2000)
+    } catch(e) { console.error('LN address save failed:', e) }
+    setLnSaving(false)
+  }
 
   const copyNpub = async () => {
     try { await navigator.clipboard.writeText(npub); setCopied(true); setTimeout(() => setCopied(false), 2000) } catch {}
@@ -90,6 +129,48 @@ export default function Settings() {
 
       <div style={{ padding: '0 16px' }}>
 
+        {/* Marketplace filter */}
+        <SectionLabel label="Marketplace"/>
+        <div style={{ borderRadius:14,overflow:'hidden',border:`1px solid ${C.border}` }}>
+          <div style={{ background:C.white,padding:'14px 16px',display:'flex',alignItems:'center',gap:14 }}>
+            <div style={{ width:36,height:36,borderRadius:10,background:C.bg,border:`1px solid ${C.border}`,display:'flex',alignItems:'center',justifyContent:'center',flexShrink:0 }}>
+              <Server size={16} color={C.black}/>
+            </div>
+            <div style={{ flex:1 }}>
+              <div style={{ fontSize:14,fontWeight:600,color:C.black,marginBottom:2 }}>
+                {bitsokoOnly ? 'Bitsoko merchants only' : 'Global marketplace'}
+              </div>
+              <div style={{ fontSize:11,color:C.muted,lineHeight:1.5 }}>
+                {bitsokoOnly
+                  ? 'Showing African Bitcoin circular economy sellers'
+                  : 'Showing all Nostr marketplace listings worldwide'}
+              </div>
+            </div>
+            {/* Toggle */}
+            <button onClick={() => toggleMarketplace(!bitsokoOnly)} style={{
+              width:48,height:26,borderRadius:13,flexShrink:0,
+              background:bitsokoOnly?C.black:C.border,
+              border:'none',cursor:'pointer',position:'relative',
+              transition:'background 0.2s',
+            }}>
+              <div style={{
+                width:20,height:20,borderRadius:'50%',background:C.white,
+                position:'absolute',top:3,
+                left:bitsokoOnly?24:4,
+                transition:'left 0.2s',
+                boxShadow:'0 1px 4px rgba(0,0,0,0.2)',
+              }}/>
+            </button>
+          </div>
+          <div style={{ padding:'10px 16px',background:'rgba(247,147,26,0.04)',borderTop:`1px solid ${C.border}` }}>
+            <div style={{ fontSize:11,color:C.muted,lineHeight:1.6 }}>
+              {bitsokoOnly
+                ? 'Switch to global mode to browse products from Shopstr and other Nostr marketplaces.'
+                : 'Switch to Bitsoko mode to support African Bitcoin merchants and filter out global noise.'}
+            </div>
+          </div>
+        </div>
+
         {/* Account */}
         <SectionLabel label="Account"/>
         <div style={{ borderRadius: 14, overflow: 'hidden', border: `1px solid ${C.border}` }}>
@@ -107,17 +188,51 @@ export default function Settings() {
           </div>
           <button onClick={() => navigate('/profile')} style={{
             width: '100%', display: 'flex', alignItems: 'center', gap: 14,
-            padding: '14px 16px', background: C.white, border: 'none', cursor: 'pointer', textAlign: 'left',
+            padding: '14px 16px', background: C.white, border: 'none',
+            borderBottom: `1px solid ${C.border}`, cursor: 'pointer', textAlign: 'left',
           }}>
             <div style={{ width: 36, height: 36, borderRadius: 10, background: C.bg, border: `1px solid ${C.border}`, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
               <ChevronRight size={16} color={C.black}/>
             </div>
             <div style={{ flex: 1 }}>
               <div style={{ fontSize: 14, fontWeight: 500, color: C.black }}>Edit Profile</div>
-              <div style={{ fontSize: 11, color: C.muted, marginTop: 2 }}>Name, avatar, Lightning address</div>
+              <div style={{ fontSize: 11, color: C.muted, marginTop: 2 }}>Name, avatar, bio</div>
             </div>
             <ChevronRight size={15} color={C.muted}/>
           </button>
+
+          {/* LN Address — seller payout destination */}
+          <div style={{ background: C.white, padding: '14px 16px' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 10 }}>
+              <div style={{ width: 36, height: 36, borderRadius: 10, background: C.bg, border: `1px solid ${C.border}`, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
+                <Zap size={16} fill={C.orange} color={C.orange}/>
+              </div>
+              <div>
+                <div style={{ fontSize: 14, fontWeight: 600, color: C.black }}>Lightning Address</div>
+                <div style={{ fontSize: 11, color: C.muted }}>Where you receive payments from sales</div>
+              </div>
+            </div>
+            <div style={{ display: 'flex', gap: 8 }}>
+              <input
+                value={lnAddress}
+                onChange={e => setLnAddress(e.target.value)}
+                placeholder="you@blink.sv or you@walletofsatoshi.com"
+                style={{ flex: 1, padding: '10px 12px', background: C.bg, border: `1.5px solid ${lnAddress ? C.black : C.border}`, borderRadius: 10, outline: 'none', fontSize: 13, color: C.black, fontFamily: "'Inter',sans-serif" }}
+              />
+              <button onClick={saveLnAddress} disabled={lnSaving || !lnAddress.trim()} style={{
+                padding: '10px 16px', background: lnSaved ? C.green : C.black, border: 'none',
+                borderRadius: 10, cursor: lnAddress.trim() && !lnSaving ? 'pointer' : 'not-allowed',
+                fontSize: 12, fontWeight: 700, color: C.white, flexShrink: 0,
+                display: 'flex', alignItems: 'center', gap: 6, transition: 'background 0.2s',
+              }}>
+                {lnSaving ? <RefreshCw size={13} style={{ animation: 'spin 1s linear infinite' }}/> : lnSaved ? <Check size={13}/> : <Zap size={13}/>}
+                {lnSaved ? 'Saved!' : 'Save'}
+              </button>
+            </div>
+            <div style={{ fontSize: 11, color: C.muted, marginTop: 8, lineHeight: 1.5 }}>
+              Buyers pay you directly — Bitsoko clips 2% and sends the rest to this address instantly.
+            </div>
+          </div>
         </div>
 
         {/* Data */}
@@ -238,7 +353,7 @@ export default function Settings() {
           {showDanger && (
             <div style={{ background: 'rgba(239,68,68,0.03)', padding: '14px 16px', borderRadius: '0 0 14px 14px' }}>
               <div style={{ fontSize: 12, color: C.red, lineHeight: 1.6, marginBottom: 12 }}>
-                ⚠️ This will delete your secret key and all local data. You'll lose access permanently unless you've saved your nsec elsewhere.
+                 This will delete your secret key and all local data. You'll lose access permanently unless you've saved your nsec elsewhere.
               </div>
               <button onClick={handleClearAll} style={{ width: '100%', padding: '12px', background: C.red, border: 'none', borderRadius: 10, cursor: 'pointer', fontSize: 13, fontWeight: 700, color: C.white }}>
                 Yes, clear everything

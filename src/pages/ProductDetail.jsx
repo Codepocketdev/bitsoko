@@ -8,6 +8,7 @@ import {
 } from 'lucide-react'
 import { getProductById, getProfile, addToCart, saveProduct, saveProfile } from '../lib/db'
 import { publishOrder, getPool, getReadRelays, DEFAULT_RELAYS, KINDS } from '../lib/nostrSync'
+import { purchaseWithFeeSplit, getBalance } from '../lib/cashuWallet'
 import { nip19 } from 'nostr-tools'
 
 const C = {
@@ -154,7 +155,7 @@ export default function ProductDetail() {
           if (profileEvents.length && mounted) {
             profileEvents.sort((a, b) => b.created_at - a.created_at)
             const parsed = JSON.parse(profileEvents[0].content)
-            await saveProfile(p.pubkey, parsed)
+            await saveProfile(p.pubkey, parsed, profileEvents[0].created_at)
             if (mounted) setProfile(parsed)
           }
         } catch(e) {
@@ -169,6 +170,51 @@ export default function ProductDetail() {
     load()
     return () => { mounted = false }
   }, [id])
+
+  // ── Buy Now state ───────────────────────────
+  const [buyStatus,  setBuyStatus]  = useState('idle') // idle|checking|paying|done|error|noLN|noFunds
+  const [buyErr,     setBuyErr]     = useState('')
+
+  const handleBuyNow = async () => {
+    if (!product || buyStatus === 'paying' || buyStatus === 'done') return
+    setBuyStatus('checking'); setBuyErr('')
+
+    // Extract lud16 — check multiple field names
+    // profile may come from relay (lud16) or old storage (lightning, lud16)
+    const sellerLud16 = profile?.lud16 || profile?.lightning || profile?.lud06
+
+    console.log('[bitsoko] Buy Now — profile:', JSON.stringify(profile))
+    console.log('[bitsoko] Buy Now — sellerLud16:', sellerLud16)
+    console.log('[bitsoko] Buy Now — balance:', getBalance(), 'price:', product.price * quantity)
+
+    if (!sellerLud16) {
+      setBuyStatus('noLN')
+      setBuyErr(`Seller has no Lightning address. Profile fields: ${Object.keys(profile||{}).join(', ')}`)
+      return
+    }
+
+    const total   = product.price * quantity
+    const balance = getBalance()
+    if (balance < total) {
+      setBuyStatus('noFunds')
+      setBuyErr(`Need ${total.toLocaleString()} sats — wallet has ${balance.toLocaleString()} sats`)
+      return
+    }
+
+    setBuyStatus('paying')
+    try {
+      await purchaseWithFeeSplit({
+        sellerLud16,
+        totalSats:   total,
+        productName: product.name,
+      })
+      await publishOrder({ sellerPubkey: product.pubkey, product, quantity, message: orderMessage }).catch(() => {})
+      setBuyStatus('done')
+    } catch(e) {
+      setBuyErr(e.message || 'Payment failed')
+      setBuyStatus('error')
+    }
+  }
 
   const handleAddToCart = async () => {
     if (!product) return
@@ -189,6 +235,9 @@ export default function ProductDetail() {
       setOrderStatus('error')
     }
   }
+
+  // Show buy status inline — find the area after action buttons
+  // (status displayed in the render below)
 
   const copyLink = () => {
     navigator.clipboard?.writeText(`${window.location.origin}/product/${id}`)
@@ -221,7 +270,13 @@ export default function ProductDetail() {
   const images     = product.images?.length > 0 ? product.images : []
   const hasImages  = images.length > 0
   const sellerName = profile?.name || profile?.display_name || product.pubkey?.slice(0, 12) + '…'
-  const tags       = (product.tags || []).filter(t => t[0] === 't' && t[1] !== 'bitsoko' && t[1] !== 'bitcoin').map(t => t[1])
+  const PROPER_CATS  = ['Electronics','Fashion','Food & Drinks','Art & Crafts','Home & Living','Books','Music','Wellness','Services','Collectibles','Sports','Other']
+  const RESERVED_TAGS = new Set(['bitsoko','bitcoin','deleted','active','sold','sale','deal'])
+  const tags = [...new Set(
+    (product.tags || [])
+      .filter(t => t[0] === 't' && !RESERVED_TAGS.has(t[1]))
+      .map(t => PROPER_CATS.find(p => p.toLowerCase() === t[1].toLowerCase()) || t[1])
+  )]
   const inStock    = product.quantity === -1 || product.quantity > 0
   const stockLabel = product.quantity === -1 ? 'In stock' : product.quantity === 0 ? 'Out of stock' : `${product.quantity} left`
 
@@ -477,14 +532,41 @@ export default function ProductDetail() {
           }}>
             {cartStatus === 'added' ? <><CheckCircle size={15}/> Added</> : 'Add to cart'}
           </button>
-          <button onClick={() => setShowOrder(true)} style={{
+          <button onClick={handleBuyNow} disabled={buyStatus === 'paying' || buyStatus === 'done'} style={{
             flex: 1, padding: '13px',
             background: C.black, border: 'none', borderRadius: 12, cursor: 'pointer',
             fontSize: '0.82rem', fontWeight: 700, color: C.white,
             display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6,
           }}>
-            <Zap size={14} fill={C.orange} color={C.orange}/> Buy now
+            {buyStatus === 'paying'
+              ? <><Loader size={14} style={{ animation:'spin 1s linear infinite' }}/> Paying…</>
+              : buyStatus === 'done'
+              ? <><CheckCircle size={14}/> Paid!</>
+              : <><Zap size={14} fill={C.orange} color={C.orange}/> Buy now</>
+            }
           </button>
+        </div>
+      )}
+
+      {/* Buy Now status feedback */}
+      {buyStatus === 'noLN' && (
+        <div style={{ margin:'0 16px 8px',display:'flex',alignItems:'center',gap:8,padding:'10px 14px',borderRadius:10,background:'rgba(239,68,68,0.06)',border:'1px solid rgba(239,68,68,0.2)',fontSize:12,color:C.red }}>
+          <AlertCircle size={14}/> Seller has no Lightning address — message them directly.
+        </div>
+      )}
+      {buyStatus === 'noFunds' && (
+        <div style={{ margin:'0 16px 8px',display:'flex',alignItems:'center',gap:8,padding:'10px 14px',borderRadius:10,background:'rgba(239,68,68,0.06)',border:'1px solid rgba(239,68,68,0.2)',fontSize:12,color:C.red }}>
+          <AlertCircle size={14}/> {buyErr} — <span style={{ textDecoration:'underline',cursor:'pointer' }} onClick={() => navigate('/wallet')}>top up wallet</span>
+        </div>
+      )}
+      {buyStatus === 'error' && (
+        <div style={{ margin:'0 16px 8px',display:'flex',alignItems:'center',gap:8,padding:'10px 14px',borderRadius:10,background:'rgba(239,68,68,0.06)',border:'1px solid rgba(239,68,68,0.2)',fontSize:12,color:C.red }}>
+          <AlertCircle size={14}/> {buyErr}
+        </div>
+      )}
+      {buyStatus === 'done' && (
+        <div style={{ margin:'0 16px 8px',display:'flex',alignItems:'center',gap:8,padding:'10px 14px',borderRadius:10,background:'rgba(34,197,94,0.06)',border:'1px solid rgba(34,197,94,0.2)',fontSize:12,color:C.green }}>
+          <CheckCircle size={14}/> Payment sent! Seller notified.
         </div>
       )}
 

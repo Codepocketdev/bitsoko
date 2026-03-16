@@ -33,6 +33,16 @@ export function getWriteRelays() { return _userWriteRelays.length ? _userWriteRe
 
 export const RELAYS = DEFAULT_RELAYS
 
+// ── Bitsoko-only toggle ───────────────────────
+// true  = only show products tagged ['t','bitsoko'] — African circular economy merchants
+// false = global Nostr marketplace (all kind:30402 events like Shopstr)
+export function getBitsokoOnly() {
+  return localStorage.getItem('bitsoko_filter_mode') !== 'global'
+}
+export function setBitsokoOnly(val) {
+  localStorage.setItem('bitsoko_filter_mode', val ? 'bitsoko' : 'global')
+}
+
 export const KINDS = {
   PROFILE:       0,
   NOTE:          1,
@@ -113,9 +123,18 @@ export async function fetchAndSeed({ onProduct, onProfile, onDone } = {}) {
   const relays = [...new Set([...getReadRelays(), ...DEFAULT_RELAYS])]
 
   try {
+    // Filter based on user preference — Bitsoko merchants only or global
+    const bitsokoOnly = getBitsokoOnly()
+    const listingFilter = bitsokoOnly
+      ? { kinds: [KINDS.LISTING],       '#t': ['bitsoko'], limit: 500 }
+      : { kinds: [KINDS.LISTING],                          limit: 500 }
+    const draftFilter = bitsokoOnly
+      ? { kinds: [KINDS.LISTING_DRAFT], '#t': ['bitsoko'], limit: 200 }
+      : { kinds: [KINDS.LISTING_DRAFT],                    limit: 200 }
+
     const [listingEvents, draftEvents] = await Promise.all([
-      pool.querySync(relays, { kinds: [KINDS.LISTING],       limit: 500 }).catch(() => []),
-      pool.querySync(relays, { kinds: [KINDS.LISTING_DRAFT], limit: 200 }).catch(() => []),
+      pool.querySync(relays, listingFilter).catch(() => []),
+      pool.querySync(relays, draftFilter).catch(() => []),
     ])
 
     const mergedMap = new Map()
@@ -166,7 +185,7 @@ export async function fetchAndSeed({ onProduct, onProfile, onDone } = {}) {
         { kinds: [KINDS.PROFILE], authors: pubkeyArr, limit: pubkeyArr.length * 2 }
       ).catch(() => [])
       for (const e of profiles) {
-        await saveProfile(e.pubkey, e.content)
+        await saveProfile(e.pubkey, JSON.parse(e.content), e.created_at)
         onProfile?.(e)
       }
     }
@@ -185,10 +204,15 @@ export function startSync({ onProduct, onProfile } = {}) {
 
   _liveSub = pool.subscribe(
     relays,
-    [
-      { kinds: [KINDS.LISTING],       since },
-      { kinds: [KINDS.LISTING_DRAFT], since },
-    ],
+    getBitsokoOnly()
+      ? [
+          { kinds: [KINDS.LISTING],       '#t': ['bitsoko'], since },
+          { kinds: [KINDS.LISTING_DRAFT], '#t': ['bitsoko'], since },
+        ]
+      : [
+          { kinds: [KINDS.LISTING],       since },
+          { kinds: [KINDS.LISTING_DRAFT], since },
+        ],
     {
       async onevent(event) {
         const key = stableKey(event)
@@ -223,7 +247,7 @@ async function fetchProfileIfMissing(pubkey) {
     relays,
     [{ kinds: [KINDS.PROFILE], authors: [pubkey], limit: 1 }],
     {
-      async onevent(e) { await saveProfile(e.pubkey, e.content) },
+      async onevent(e) { await saveProfile(e.pubkey, JSON.parse(e.content), e.created_at) },
       oneose() { sub.close() },
     }
   )
@@ -293,9 +317,9 @@ export async function publishProduct({
     ['quantity',     quantity.toString()],
     ['t',            'bitsoko'],
     ['t',            'bitcoin'],
-    // FIX 2: NO .toLowerCase() — store categories exactly as provided
-    // so p.categories in db matches the filter values in Home/Explore
-    ...categories.map(c   => ['t',        c]),
+    // Deduplicate categories (case-insensitive) before tagging
+    // Prevents duplicate tags when editing a product multiple times
+    ...([...new Set(categories.map(c => c.trim()).filter(Boolean))]).map(c => ['t', c]),
     ...images.map(url      => ['image',    url]),
     ...shipping.map(s      => ['shipping', s.name || '', (s.cost || 0).toString(), 'SATS', s.regions || '']),
   ]
@@ -324,7 +348,7 @@ export async function publishProduct({
   const results = await Promise.allSettled(
     publishRelays.map(relay =>
       Promise.race([
-        getPool().publish([relay], event)
+        Promise.all(getPool().publish([relay], event))
           .then(() => console.log('[bitsoko] ✓', relay))
           .catch(e  => { throw new Error(`${relay}: ${e?.message || e}`) }),
         new Promise((_, rej) => setTimeout(() => rej(new Error(`${relay}: timeout`)), 8000)),
@@ -356,7 +380,7 @@ export async function deleteProductEvent(productId) {
     tags:       [['e', product.event_id || product.id]],
     content:    'deleted',
   }, sk)
-  try { await Promise.any(getPool().publish(relays, kind5)) } catch {}
+  try { await Promise.any(getPool().publish(relays, kind5).map(p => p.catch(e => { throw e }))) } catch {}
 
   // kind:30403 tombstone
   const tombstone = finalizeEvent({
@@ -372,7 +396,7 @@ export async function deleteProductEvent(productId) {
   }, sk)
 
   await deleteProduct(productId)
-  await Promise.any(getPool().publish(relays, tombstone))
+  await Promise.any(getPool().publish(relays, tombstone).map(p => p.catch(e => { throw e })))
   return tombstone
 }
 
@@ -436,7 +460,7 @@ export async function publishOrder({ sellerPubkey, product, quantity, message = 
   })
 
   const publishRelays = [...new Set([...relays, ...DEFAULT_RELAYS])]
-  await Promise.any(getPool().publish(publishRelays, event))
+  await Promise.any(getPool().publish(publishRelays, event).map(p => p.catch(e => { throw e })))
   return event
 }
 

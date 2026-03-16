@@ -76,7 +76,7 @@ export default function Cart() {
   const navigate = useNavigate()
 
   const [items,       setItems]       = useState([])
-  const [loading,     setLoading]     = useState(true)
+  const [loading,     setLoading]     = useState(false)
   const [placing,     setPlacing]     = useState(false)
   const [orderStatus, setOrderStatus] = useState('idle') // idle | placing | done | error
   const [orderErr,    setOrderErr]    = useState('')

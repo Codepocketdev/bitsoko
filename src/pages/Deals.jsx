@@ -172,12 +172,16 @@ function DealCard({ product, profile, onClick }) {
           {product.name || 'Untitled'}
         </div>
         <div style={{ marginBottom:6 }}>
-          {product.originalPrice > 0 && (
-            <span style={{ fontSize:10, color:C.muted, textDecoration:'line-through', marginRight:5 }}>
+          {product.originalPrice > 0 && product.originalPrice > product.price && (
+            <div style={{ fontSize:10,color:C.muted,textDecoration:'line-through',marginBottom:1 }}>
               {product.originalPrice.toLocaleString()} sats
-            </span>
+            </div>
           )}
-          <span style={{ fontSize:11, color:C.muted }}>{satsToKsh(product.price)}</span>
+          <div style={{ display:'flex',alignItems:'center',gap:4 }}>
+            <Zap size={10} fill={C.orange} color={C.orange}/>
+            <span style={{ fontSize:12,fontWeight:700,color:C.black }}>{product.price?.toLocaleString()} sats</span>
+          </div>
+          <div style={{ fontSize:10,color:C.muted }}>{satsToKsh(product.price)}</div>
         </div>
         <div style={{ display:'flex', alignItems:'center', gap:5 }}>
           <Avatar profile={profile} pubkey={product.pubkey} size={16}/>
@@ -409,25 +413,8 @@ export default function Deals() {
               Sellers can mark their listings as deals when creating or editing a product. Check back soon.
             </div>
 
-            {/* How to post a deal */}
-            <div style={{
-              background: C.white, borderRadius: 14,
-              border: `1px solid ${C.border}`,
-              padding: '16px', textAlign: 'left', maxWidth: 320, width: '100%',
-            }}>
-              <div style={{ display:'flex', alignItems:'center', gap:8, marginBottom:10 }}>
-                <AlertCircle size={14} color={C.ochre}/>
-                <span style={{ fontSize:12, fontWeight:700, color:C.black }}>Are you a seller?</span>
-              </div>
-              <div style={{ fontSize:11, color:C.muted, lineHeight:1.6, marginBottom:12 }}>
-                When creating or editing a listing, toggle <strong style={{ color:C.black }}>"Mark as Deal"</strong> to feature it here.
-              </div>
-              <button onClick={() => navigate('/create-listing')} style={{
-                width:'100%', padding:'11px', background:C.black, border:'none',
-                borderRadius:10, cursor:'pointer', fontSize:12, fontWeight:700, color:C.white,
-              }}>
-                + Post a deal listing
-              </button>
+            <div style={{ fontSize:12, color:C.muted, lineHeight:1.6, maxWidth:280, textAlign:'center' }}>
+              Mark a listing as a deal when creating or editing a product to feature it here.
             </div>
           </div>
         )}

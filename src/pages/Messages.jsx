@@ -116,6 +116,20 @@ export default function Messages() {
   const bottomRef = useRef(null)
 
   // ── Fetch and decrypt all DMs ──────────────
+  const CACHE_KEY = `bitsoko_msgs_${myPubkey}`
+
+  // Load cached conversations instantly on mount
+  useEffect(() => {
+    if (!myPubkey) return
+    try {
+      const cached = localStorage.getItem(CACHE_KEY)
+      if (cached) {
+        setConversations(JSON.parse(cached))
+        setLoading(false)
+      }
+    } catch {}
+  }, [myPubkey])
+
   useEffect(() => {
     if (!myPubkey) { setLoading(false); return }
 
@@ -184,6 +198,7 @@ export default function Messages() {
         }
 
         setConversations(convMap)
+        try { localStorage.setItem(CACHE_KEY, JSON.stringify(convMap)) } catch {}
       } catch(e) {
         setError('Could not load messages. Check your connection.')
         console.error('[bitsoko] messages error:', e)

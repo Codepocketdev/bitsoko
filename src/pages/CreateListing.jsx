@@ -152,7 +152,7 @@ function PhotoStep({ images, setImages }) {
 }
 
 // ── Step 2: Details ───────────────────────────
-function DetailsStep({ name, setName, description, setDescription, categories, setCategories, isDeal, setIsDeal, originalPrice, setOriginalPrice }) {
+function DetailsStep({ name, setName, description, setDescription, categories, setCategories, isDeal, setIsDeal, discountPct, setDiscountPct, preDealPrice, setPreDealPrice, price, setPrice }) {
   const toggle = (cat) =>
     setCategories(prev => prev.includes(cat) ? prev.filter(c => c !== cat) : [...prev, cat])
 
@@ -232,7 +232,18 @@ function DetailsStep({ name, setName, description, setDescription, categories, s
           </div>
         </div>
         {/* Toggle switch */}
-        <button onClick={() => setIsDeal(d => !d)} style={{
+        <button onClick={() => {
+            if (isDeal) {
+              // Turning OFF — restore pre-deal price
+              if (preDealPrice) setPrice(preDealPrice)
+              setDiscountPct('')
+              setPreDealPrice('')
+            } else {
+              // Turning ON — save current price as pre-deal
+              setPreDealPrice(price)
+            }
+            setIsDeal(d => !d)
+          }} style={{
           width: 48, height: 26, borderRadius: 13, flexShrink: 0,
           background: isDeal ? C.deal : C.border,
           border: 'none', cursor: 'pointer', position: 'relative',
@@ -248,32 +259,34 @@ function DetailsStep({ name, setName, description, setDescription, categories, s
         </button>
       </div>
 
-      {/* Original price — only shown when isDeal is on */}
+      {/* Discount % — only shown when isDeal is on */}
       {isDeal && (
         <div style={{ marginTop: 12, padding: '14px 16px', background: 'rgba(232,97,74,0.04)', border: `1px solid rgba(232,97,74,0.15)`, borderRadius: 12 }}>
           <label style={{ display:'block', fontSize:'0.75rem', fontWeight:600, color:C.deal, marginBottom:8 }}>
-            Original price (sats) — optional
+            Discount % — optional
           </label>
           <div style={{ position:'relative' }}>
-            <div style={{ position:'absolute', left:12, top:'50%', transform:'translateY(-50%)' }}>
-              <Zap size={13} fill={C.orange} color={C.orange}/>
-            </div>
             <input
-              type="number" min="0"
-              value={originalPrice}
-              onChange={e => setOriginalPrice(e.target.value)}
-              placeholder="e.g. 80000 — shows discount %"
+              type="number" min="1" max="99"
+              value={discountPct}
+              onChange={e => setDiscountPct(e.target.value)}
+              placeholder="e.g. 20 for 20% off"
               style={{
-                width:'100%', padding:'10px 12px 10px 32px',
+                width:'100%', padding:'10px 40px 10px 12px',
                 background:C.white, border:`1px solid rgba(232,97,74,0.25)`,
                 borderRadius:10, outline:'none', fontSize:'0.85rem',
                 color:C.black, fontFamily:"'Inter',sans-serif", boxSizing:'border-box',
               }}
             />
+            <span style={{ position:'absolute',right:12,top:'50%',transform:'translateY(-50%)',fontSize:14,fontWeight:700,color:C.deal }}>%</span>
           </div>
-          {originalPrice && parseInt(originalPrice) > 0 && (
-            <div style={{ fontSize:11, color:C.deal, marginTop:6 }}>
-              Discount badge will show on listing
+          {discountPct && parseInt(discountPct) > 0 && price && parseInt(price) > 0 && (
+            <div style={{ fontSize:11, color:C.muted, marginTop:6, lineHeight:1.6 }}>
+              Was: <span style={{ textDecoration:'line-through' }}>{parseInt(price).toLocaleString()} sats</span>
+              {' '}→ Now: <strong style={{ color:'#e8614a' }}>
+                {Math.round(parseInt(price)*(1-parseInt(discountPct)/100)).toLocaleString()} sats
+              </strong>
+              {' '}(KSh {Math.round((Math.round(parseInt(price)*(1-parseInt(discountPct)/100))/100000000)*13000000).toLocaleString()})
             </div>
           )}
         </div>
@@ -460,7 +473,8 @@ export default function CreateListing() {
   const [description, setDescription] = useState(draft?.description ?? '')
   const [categories,  setCategories]  = useState(draft?.categories  ?? [])
   const [isDeal,      setIsDeal]      = useState(draft?.isDeal      ?? false)
-  const [originalPrice,setOriginalPrice]= useState(draft?.originalPrice ?? '')
+  const [discountPct,  setDiscountPct]  = useState(draft?.discountPct  ?? '')
+  const [preDealPrice, setPreDealPrice] = useState(draft?.preDealPrice ?? '')
   const [price,       setPrice]       = useState(draft?.price       ?? '')
   const [quantity,    setQuantity]    = useState(draft?.quantity     ?? -1)
   const [shipping,    setShipping]    = useState(draft?.shipping     ?? [])
@@ -469,7 +483,7 @@ export default function CreateListing() {
 
   // Auto-save draft
   useEffect(() => {
-    saveDraft({ step, images, name, description, categories, isDeal, originalPrice, price, quantity, shipping })
+    saveDraft({ step, images, name, description, categories, isDeal, discountPct, price, quantity, shipping })
   }, [step, images, name, description, categories, isDeal, price, quantity, shipping])
 
   const canNext = () => {
@@ -491,7 +505,20 @@ export default function CreateListing() {
         description: description.trim(),
         price:       parseInt(price),
         images, quantity, categories, shipping,
-        isDeal, originalPrice: isDeal && parseInt(originalPrice) > 0 ? parseInt(originalPrice) : 0,
+        // originalPrice = was-price (current price before discount)
+        // price passed to publishProduct = sale price (reduced by pct)
+        ...(() => {
+          const pct = parseInt(discountPct)
+          const p   = parseInt(price)
+          if (isDeal && pct > 0 && pct < 100 && p > 0) {
+            return {
+              price:         Math.round(p * (1 - pct / 100)),
+              originalPrice: p,
+              isDeal:        true,
+            }
+          }
+          return { price: p, originalPrice: 0, isDeal }
+        })(),
         stall_id: `stall-${localStorage.getItem('bitsoko_npub')?.slice(0, 8) || 'default'}`,
       })
       setStatus('done')
@@ -531,8 +558,8 @@ export default function CreateListing() {
             name={name} setName={setName}
             description={description} setDescription={setDescription}
             categories={categories} setCategories={setCategories}
-            isDeal={isDeal} setIsDeal={setIsDeal}
-          originalPrice={originalPrice} setOriginalPrice={setOriginalPrice}
+            isDeal={isDeal} setIsDeal={setIsDeal} preDealPrice={preDealPrice} setPreDealPrice={setPreDealPrice} price={price} setPrice={setPrice}
+          discountPct={discountPct} setDiscountPct={setDiscountPct}
           />
         )}
         {step === 3 && (

@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
 import {
-  Plus, Package, Zap, Loader, Pencil,
+  Plus, Package, Zap, Loader, Pencil, Check,
   Trash2, Eye, AlertCircle, CheckCircle,
   Store, BarChart2, X, ArrowLeft,
   Upload, Minus, Truck, Tag,
@@ -82,9 +82,26 @@ function EditSheet({ product, onSave, onCancel }) {
   const [description, setDescription] = useState(product.description || '')
   const [price,       setPrice]       = useState(String(product.price || ''))
   const [quantity,    setQuantity]    = useState(product.quantity     ?? -1)
-  const [categories,  setCategories]  = useState(
-    (product.tags||[]).filter(t=>t[0]==='t'&&!['bitsoko','bitcoin','deleted'].includes(t[1])).map(t=>t[1])
-  )
+  const [categories,  setCategories]  = useState(() => {
+    const CATS = ['Electronics','Fashion','Food & Drinks','Art & Crafts','Home & Living','Books','Music','Wellness','Services','Collectibles','Sports','Other']
+    const raw  = product.categories || []
+    // Normalize: match lowercase to proper case, deduplicate
+    const normalized = raw
+      .map(c => CATS.find(p => p.toLowerCase() === c.toLowerCase()) || c)
+      .filter((c, i, arr) => arr.indexOf(c) === i) // deduplicate
+    return normalized
+  })
+  const [isDeal,       setIsDeal]       = useState(() => (product.tags||[]).some(t=>t[0]==='t'&&t[1]==='deal'))
+  const [discountPct,  setDiscountPct]  = useState(() => {
+    const origTag = (product.tags||[]).find(t=>t[0]==='original_price')
+    if (!origTag) return ''
+    const orig = parseInt(origTag[1])
+    const curr = product.price || 0
+    // orig is the was-price, curr is the sale price
+    // pct = how much was taken off the original
+    if (orig > curr && orig > 0) return String(Math.round(((orig - curr) / orig) * 100))
+    return ''
+  })
   const [shipping,  setShipping]  = useState(product.shipping || [])
   const [uploading, setUploading] = useState(false)
   const [saving,    setSaving]    = useState(false)
@@ -108,6 +125,17 @@ function EditSheet({ product, onSave, onCancel }) {
     setUploading(false)
   }
 
+  const toggleDeal = () => {
+    const turningOff = isDeal
+    setIsDeal(d => !d)
+    if (turningOff) {
+      // Restore original price when deal is turned off
+      const origTag = (product.tags||[]).find(t=>t[0]==='original_price')
+      if (origTag) setPrice(origTag[1])
+      setDiscountPct('')
+    }
+  }
+
   const toggleCat = (cat) =>
     setCategories(prev => prev.includes(cat) ? prev.filter(c=>c!==cat) : [...prev, cat])
   const addShipping    = () => setShipping(prev=>[...prev,{name:'',cost:'',regions:''}])
@@ -119,7 +147,15 @@ function EditSheet({ product, onSave, onCancel }) {
     if (!name.trim()) { setErrMsg('Name is required'); return }
     setSaving(true); setErrMsg('')
     try {
-      await onSave({ images, name, description, price:parseInt(price), quantity, categories, shipping })
+      const discPct   = parseInt(discountPct)
+      const currPrice = parseInt(price)
+      // originalPrice = the was-price (current listing price before discount)
+      // salePrice     = currPrice * (1 - pct/100)
+      const salePrice       = isDeal && discPct > 0 && discPct < 100
+        ? Math.round(currPrice * (1 - discPct / 100))
+        : currPrice
+      const computedOriginal = isDeal && discPct > 0 && discPct < 100 ? currPrice : 0
+      await onSave({ images, name, description, price: salePrice, quantity, categories, shipping, isDeal, originalPrice: computedOriginal })
       setSaved(true)
       setTimeout(() => onCancel(), 1200) // auto-close after showing success
     }
@@ -260,6 +296,45 @@ function EditSheet({ product, onSave, onCancel }) {
                 </div>
                 <div style={{ fontSize:'0.68rem',color:C.muted,marginTop:6 }}>Unlimited for digital goods or services</div>
               </div>
+
+              {/* Mark as Deal */}
+              <div style={{ marginTop:18,background:isDeal?'rgba(232,97,74,0.06)':C.white,border:`1.5px solid ${isDeal?'rgba(232,97,74,0.4)':C.border}`,borderRadius:14,padding:'14px 16px',display:'flex',alignItems:'center',gap:14,transition:'all 0.2s' }}>
+                <div style={{ flex:1 }}>
+                  <div style={{ fontSize:13,fontWeight:700,color:C.black,marginBottom:3,display:'flex',alignItems:'center',gap:6 }}>
+                    <Tag size={13} color={isDeal?'#e8614a':C.muted}/>
+                    Mark as Deal
+                    {isDeal && <span style={{ background:'#e8614a',color:'#fff',fontSize:9,fontWeight:800,padding:'2px 7px',borderRadius:99 }}>ACTIVE</span>}
+                  </div>
+                  <div style={{ fontSize:11,color:C.muted }}>Featured on the Deals page</div>
+                </div>
+                <button onClick={toggleDeal} style={{ width:48,height:26,borderRadius:13,flexShrink:0,background:isDeal?'#e8614a':C.border,border:'none',cursor:'pointer',position:'relative',transition:'background 0.2s' }}>
+                  <div style={{ width:20,height:20,borderRadius:'50%',background:C.white,position:'absolute',top:3,left:isDeal?24:4,transition:'left 0.2s',boxShadow:'0 1px 4px rgba(0,0,0,0.2)' }}/>
+                </button>
+              </div>
+              {isDeal && (
+                <div style={{ marginTop:10,padding:'12px 14px',background:'rgba(232,97,74,0.04)',border:'1px solid rgba(232,97,74,0.15)',borderRadius:12 }}>
+                  <div style={{ fontSize:12,fontWeight:600,color:'#e8614a',marginBottom:8 }}>Discount % — optional</div>
+                  <div style={{ position:'relative' }}>
+                    <input type="number" min="1" max="99" value={discountPct} onChange={e=>setDiscountPct(e.target.value)}
+                      placeholder="e.g. 20 for 20% off"
+                      style={{ width:'100%',padding:'10px 40px 10px 12px',background:C.white,border:'1px solid rgba(232,97,74,0.25)',borderRadius:10,outline:'none',fontSize:13,color:C.black,boxSizing:'border-box' }}/>
+                    <span style={{ position:'absolute',right:12,top:'50%',transform:'translateY(-50%)',fontSize:13,fontWeight:700,color:'#e8614a' }}>%</span>
+                  </div>
+                  {discountPct && parseInt(discountPct) > 0 && parseInt(price) > 0 && (
+                    <div style={{ marginTop:8,fontSize:11,color:C.muted,display:'flex',gap:12,flexWrap:'wrap' }}>
+                      <span>Was: <strong style={{ textDecoration:'line-through',color:C.muted }}>
+                        {parseInt(price).toLocaleString()} sats
+                      </strong></span>
+                      <span>Now: <strong style={{ color:'#e8614a' }}>
+                        {Math.round(parseInt(price)*(1-parseInt(discountPct)/100)).toLocaleString()} sats
+                      </strong></span>
+                      <span style={{ color:'#e8614a' }}>
+                        (KSh {Math.round((Math.round(parseInt(price)*(1-parseInt(discountPct)/100))/100000000)*13000000).toLocaleString()})
+                      </span>
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
           )}
 
@@ -325,7 +400,10 @@ function ProductRow({ product, onEdit, onDelete, onView }) {
         <div style={{ fontSize:'0.85rem',fontWeight:700,color:C.black,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap',marginBottom:3 }}>
           {product.name || 'Untitled'}
         </div>
-        <div style={{ display:'flex',alignItems:'center',gap:4,marginBottom:3 }}>
+        <div style={{ display:'flex',alignItems:'center',gap:4,marginBottom:3,flexWrap:'wrap' }}>
+          {product.originalPrice > product.price && product.originalPrice > 0 && (
+            <span style={{ fontSize:'0.68rem',color:C.muted,textDecoration:'line-through' }}>{product.originalPrice?.toLocaleString()} sats</span>
+          )}
           <Zap size={11} fill={C.orange} color={C.orange}/>
           <span style={{ fontSize:'0.75rem',fontWeight:700,color:C.black }}>{product.price?.toLocaleString()} sats</span>
           <span style={{ fontSize:'0.68rem',color:C.muted }}>· {satsToKsh(product.price)}</span>
@@ -418,8 +496,8 @@ export default function MyShop() {
     setDeleting(false)
   }
 
-  const handleSaveEdit = async ({ images, name, description, price, quantity, categories, shipping }) => {
-    await publishProduct({ name, description, price, images, quantity, categories, shipping, productId: editProduct.id })
+  const handleSaveEdit = async ({ images, name, description, price, quantity, categories, shipping, isDeal, originalPrice }) => {
+    await publishProduct({ name, description, price, images, quantity, categories, shipping, productId: editProduct.id, isDeal, originalPrice })
     const prods = await getProductsByPubkey(pubkeyHex)
     setProducts(prods.filter(p => p.status !== 'deleted' && !p.tags?.some(t=>t[0]==='t'&&t[1]==='deleted')))
     setEditProduct(null)

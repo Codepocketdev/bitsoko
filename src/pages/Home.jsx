@@ -341,10 +341,18 @@ export default function Home() {
                 <RefreshCw size={10}/> {newCount} new
               </button>
             )}
-            <button style={{
+            <button onClick={() => navigate('/create-listing')} style={{
+              width: 36, height: 36, borderRadius: '50%',
+              background: C.black, border: 'none',
+              display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer',
+            }}>
+              <Plus size={17} color={C.white}/>
+            </button>
+            <button onClick={() => navigate('/messages')} style={{
               width: 36, height: 36, borderRadius: '50%',
               background: C.bg, border: `1px solid ${C.border}`,
               display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer',
+              position: 'relative',
             }}>
               <Bell size={17} color={C.black}/>
             </button>
