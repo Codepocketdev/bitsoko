@@ -19,8 +19,9 @@ import ShopAnalytics from './pages/ShopAnalytics'
 import CreateListing from './pages/CreateListing'
 import ProductDetail from './pages/ProductDetail'
 import PageWrapper   from './components/layout/PageWrapper'
+import BTCMap       from './pages/BTCMap'
 
-// Lazy load Wallet so cashu-ts issues never crash the whole app
+// Lazy load heavy/optional pages so crashes stay isolated
 const Wallet = lazy(() => import('./pages/Wallet'))
 
 const isLoggedIn = () => !!localStorage.getItem('bitsoko_nsec')
@@ -63,6 +64,7 @@ export default function App() {
         <Route path="/product/:id"      element={<ProductDetail />}/>
         <Route path="/seller/:pubkey"   element={<SellerProfile />}/>
         <Route path="/wallet"          element={<Suspense fallback={<div style={{minHeight:'100vh',background:'#1a1410'}}/>}><Wallet /></Suspense>}/>
+        <Route path="/map"              element={<BTCMap />}/>
 
         {/* App shell — PageWrapper stays mounted across ALL these routes.
             FIX: Profile was outside PageWrapper before, causing a full

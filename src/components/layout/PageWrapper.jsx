@@ -3,7 +3,7 @@ import { useLocation, useNavigate } from 'react-router-dom'
 import {
   Home, Search, Tag, ShoppingCart, Menu,
   User, Store, Package, MessageCircle,
-  Settings, X, Zap, ChevronRight
+  Settings, X, Zap, ChevronRight, Map
 } from 'lucide-react'
 
 const NAV_ITEMS = [
@@ -22,6 +22,7 @@ const MORE_ITEMS = [
       { path: '/orders',   icon: Package,      label: 'Orders',   sub: 'Purchases & sales'         },
       { path: '/messages', icon: MessageCircle,label: 'Messages', sub: 'DMs with buyers & sellers' },
       { path: '/wallet',   icon: Zap,           label: 'Wallet',   sub: 'Cashu • Lightning payments'  },
+      { path: '/map',     icon: Map,           label: 'Bitcoin Map', sub: 'Bitcoin merchants near you'  },
     ]
   },
   {
@@ -148,7 +149,7 @@ function BottomNav({ onMorePress }) {
   const location   = useLocation()
   const navigate   = useNavigate()
   const current    = location.pathname
-  const moreActive = ['/profile','/shop','/orders','/messages','/settings','/wallet'].includes(current)
+  const moreActive = ['/profile','/shop','/orders','/messages','/settings','/wallet','/map'].includes(current)
 
   return (
     <nav style={{
