@@ -9,6 +9,7 @@ import {
 import { openDB, getProducts, getProfile, getProfiles } from '../lib/db'
 import { fetchAndSeed, startSync, stopSync, getPublicKeyHex } from '../lib/nostrSync'
 import { useNostrProfile } from '../hooks/useNostrProfile'
+import { useNotifications } from '../hooks/useNotifications'
 import { satsToKsh, useRate } from '../lib/rates'
 
 const C = {
@@ -126,7 +127,7 @@ function ProductCard({ product, profile, onClick, rate }) {
 
 export default function Home() {
   const navigate = useNavigate()
-  const rate     = useRate() // ← live BTC/KES rate
+  const rate     = useRate()
 
   const [products,     setProducts]     = useState([])
   const [profiles,     setProfiles]     = useState({})
@@ -141,6 +142,11 @@ export default function Home() {
 
   const _pubkeyHex = (() => { try { return getPublicKeyHex() } catch { return '' } })()
   const { profile: _userProfile } = useNostrProfile(_pubkeyHex)
+
+  // ── Notifications ─────────────────────────
+  const { unreadCount } = useNotifications()
+
+  const handleBellClick = () => navigate('/messages')
 
   const [displayName, setDisplayName] = useState(
     () => localStorage.getItem('bitsoko_display_name') || null
@@ -332,13 +338,27 @@ export default function Home() {
             }}>
               <Plus size={17} color={C.white}/>
             </button>
-            <button onClick={() => navigate('/messages')} style={{
+
+            {/* ── Bell with unread badge ── */}
+            <button onClick={handleBellClick} style={{
               width: 36, height: 36, borderRadius: '50%',
               background: C.bg, border: `1px solid ${C.border}`,
               display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer',
               position: 'relative',
             }}>
-              <Bell size={17} color={C.black}/>
+              <Bell size={17} color={unreadCount > 0 ? C.orange : C.black}/>
+              {unreadCount > 0 && (
+                <div style={{
+                  position: 'absolute', top: -2, right: -2,
+                  minWidth: 16, height: 16, borderRadius: 99,
+                  background: C.orange, border: `2px solid ${C.white}`,
+                  display: 'flex', alignItems: 'center', justifyContent: 'center',
+                  fontSize: 9, fontWeight: 800, color: C.white,
+                  padding: '0 3px', fontFamily: "'Inter',sans-serif",
+                }}>
+                  {unreadCount > 99 ? '99+' : unreadCount}
+                </div>
+              )}
             </button>
           </div>
         </div>

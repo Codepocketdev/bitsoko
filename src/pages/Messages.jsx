@@ -2,13 +2,14 @@ import { useState, useEffect, useRef } from 'react'
 import { useNavigate } from 'react-router-dom'
 import {
   ArrowLeft, Send, Loader, Lock,
-  MessageCircle, ChevronLeft, Package,
+  MessageCircle, ChevronLeft,
 } from 'lucide-react'
 import { getPool, getReadRelays, getWriteRelays, DEFAULT_RELAYS, getSecretKey } from '../lib/nostrSync'
 import { getProfile, saveProfile } from '../lib/db'
 import { nip04 } from 'nostr-tools'
 import { finalizeEvent } from 'nostr-tools/pure'
 import { nip19 } from 'nostr-tools'
+import { saveUnreadCount, markAllMessagesRead, getLastSeenTs } from '../hooks/useNotifications'
 
 const C = {
   bg:     '#f7f4f0',
@@ -22,7 +23,6 @@ const C = {
   green:  '#22c55e',
 }
 
-// Convert Uint8Array secret key to hex string for nip04
 const skToHex = (sk) => Array.from(sk).map(b => b.toString(16).padStart(2, '0')).join('')
 
 function timeAgo(ts) {
@@ -32,6 +32,88 @@ function timeAgo(ts) {
   if (s < 86400) return `${Math.floor(s/3600)}h`
   return new Date(ts * 1000).toLocaleDateString('en', { month: 'short', day: 'numeric' })
 }
+
+// ── NIP-42 raw WS DM fetcher (borrowed from satscode) ────────────────────────
+function fetchDMsFromRelay(relayUrl, skBytes, f1, f2, onEvent, onDone) {
+  const subId = 'dm-' + Math.random().toString(36).slice(2, 8)
+  let ws, done = false, authed = false
+
+  const finish = () => {
+    if (done) return; done = true
+    try { ws?.close() } catch {}
+    onDone()
+  }
+  const sendReq  = () => ws.send(JSON.stringify(['REQ', subId, f1, f2]))
+  const sendAuth = (ch) => {
+    const ev = finalizeEvent({
+      kind: 22242,
+      created_at: Math.floor(Date.now() / 1000),
+      tags: [['relay', relayUrl], ['challenge', ch]],
+      content: '',
+    }, skBytes)
+    ws.send(JSON.stringify(['AUTH', ev]))
+  }
+
+  try {
+    ws = new WebSocket(relayUrl)
+    ws.onopen    = () => sendReq()
+    ws.onmessage = ({ data }) => {
+      if (done) return
+      let msg; try { msg = JSON.parse(data) } catch { return }
+      const [type, ...rest] = msg
+      if (type === 'AUTH') sendAuth(rest[0])
+      if (type === 'OK' && !authed) { authed = true; sendReq() }
+      if (type === 'EVENT' && rest[1]?.kind === 4) onEvent(rest[1])
+      if (type === 'EOSE') finish()
+      if (type === 'CLOSED' && !(rest[1] || '').toLowerCase().includes('auth-required')) finish()
+    }
+    ws.onerror = () => finish()
+    ws.onclose = () => finish()
+    setTimeout(() => finish(), 12000)
+  } catch { finish() }
+
+  return () => { done = true; try { ws?.close() } catch {} }
+}
+
+// ── Live WS subscription — stays open, auto-reconnects (borrowed from satscode) ──
+function subscribeLiveDMs(relayUrl, skBytes, f1, f2, onEvent) {
+  let ws, closed = false, authed = false
+  const subId = 'dm-live-' + Math.random().toString(36).slice(2, 8)
+
+  const sendReq  = () => ws.send(JSON.stringify(['REQ', subId, f1, f2]))
+  const sendAuth = (ch) => {
+    const ev = finalizeEvent({
+      kind: 22242,
+      created_at: Math.floor(Date.now() / 1000),
+      tags: [['relay', relayUrl], ['challenge', ch]],
+      content: '',
+    }, skBytes)
+    ws.send(JSON.stringify(['AUTH', ev]))
+  }
+
+  const connect = () => {
+    if (closed) return
+    try {
+      ws = new WebSocket(relayUrl)
+      ws.onopen    = () => { if (!closed) sendReq() }
+      ws.onmessage = ({ data }) => {
+        if (closed) return
+        let msg; try { msg = JSON.parse(data) } catch { return }
+        const [type, ...rest] = msg
+        if (type === 'AUTH') sendAuth(rest[0])
+        if (type === 'OK' && !authed) { authed = true; sendReq() }
+        if (type === 'EVENT' && rest[1]?.kind === 4) onEvent(rest[1])
+      }
+      ws.onerror = () => {}
+      ws.onclose = () => { if (!closed) setTimeout(connect, 3000) } // auto-reconnect
+    } catch {}
+  }
+
+  connect()
+  return () => { closed = true; try { ws?.close() } catch {} }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 
 function Avatar({ profile, pubkey, size = 40 }) {
   const [err, setErr] = useState(false)
@@ -54,7 +136,6 @@ function Avatar({ profile, pubkey, size = 40 }) {
   )
 }
 
-// ── Conversation list item ──────────────────────
 function ConversationRow({ partnerPubkey, profile, lastMessage, lastTs, unread, onClick }) {
   const name = profile?.display_name || profile?.name || `${partnerPubkey.slice(0,8)}…`
   return (
@@ -82,7 +163,6 @@ function ConversationRow({ partnerPubkey, profile, lastMessage, lastTs, unread, 
   )
 }
 
-// ── Message bubble ──────────────────────────────
 function Bubble({ text, ts, isMe }) {
   return (
     <div style={{ display: 'flex', justifyContent: isMe ? 'flex-end' : 'flex-start', marginBottom: 8 }}>
@@ -102,121 +182,162 @@ function Bubble({ text, ts, isMe }) {
 }
 
 export default function Messages() {
-  const navigate   = useNavigate()
-  const myPubkey   = (() => {
+  const navigate = useNavigate()
+  const myPubkey = (() => {
     try { return nip19.decode(localStorage.getItem('bitsoko_npub')).data } catch { return null }
   })()
 
-  const [loading,      setLoading]      = useState(true)
-  const [error,        setError]        = useState('')
-  const [conversations,setConversations]= useState({}) // { pubkey: { profile, messages: [], lastTs } }
-  const [selected,     setSelected]     = useState(null) // partnerPubkey
-  const [input,        setInput]        = useState('')
-  const [sending,      setSending]      = useState(false)
-  const bottomRef = useRef(null)
+  const [loading,       setLoading]       = useState(true)
+  const [error,         setError]         = useState('')
+  const [conversations, setConversations] = useState({})
+  const [selected,      setSelected]      = useState(null)
+  const [input,         setInput]         = useState('')
+  const [sending,       setSending]       = useState(false)
 
-  // ── Fetch and decrypt all DMs ──────────────
+  const bottomRef  = useRef(null)
+  const seenRef    = useRef(new Set())
+  const convRef    = useRef({})
+  const liveClosersRef = useRef([])
+
   const CACHE_KEY = `bitsoko_msgs_${myPubkey}`
 
-  // Load cached conversations instantly on mount
+  // ── Load cache instantly ────────────────────
   useEffect(() => {
     if (!myPubkey) return
     try {
       const cached = localStorage.getItem(CACHE_KEY)
       if (cached) {
-        setConversations(JSON.parse(cached))
+        const parsed = JSON.parse(cached)
+        convRef.current = parsed
+        setConversations(parsed)
         setLoading(false)
       }
     } catch {}
   }, [myPubkey])
 
+  // ── Main fetch + live subscription ──────────
   useEffect(() => {
     if (!myPubkey) { setLoading(false); return }
 
-    const load = async () => {
-      try {
-        const relays = [...new Set([...getReadRelays(), ...DEFAULT_RELAYS])]
-        const pool   = getPool()
-        const sk     = getSecretKey()
-        const skHex  = skToHex(sk)
-
-        // Fetch sent and received in parallel
-        const [sent, received] = await Promise.all([
-          pool.querySync(relays, { kinds: [4], authors: [myPubkey], limit: 200 }),
-          pool.querySync(relays, { kinds: [4], '#p': [myPubkey], limit: 200 }),
-        ])
-
-        const all = [...sent, ...received]
-        // Deduplicate by event id
-        const unique = Array.from(new Map(all.map(e => [e.id, e])).values())
-        unique.sort((a, b) => a.created_at - b.created_at)
-
-        // Build conversations map
-        const convMap = {}
-
-        for (const event of unique) {
-          const isMe      = event.pubkey === myPubkey
-          const partnerPk = isMe
-            ? (event.tags.find(t => t[0] === 'p')?.[1] || '')
-            : event.pubkey
-
-          if (!partnerPk) continue
-
-          // Decrypt
-          let text = '[encrypted message]'
-          try {
-            text = await nip04.decrypt(skHex, partnerPk, event.content)
-          } catch {}
-
-          if (!convMap[partnerPk]) convMap[partnerPk] = { messages: [], lastTs: 0, profile: null }
-
-          convMap[partnerPk].messages.push({ id: event.id, text, ts: event.created_at, isMe })
-          if (event.created_at > convMap[partnerPk].lastTs) {
-            convMap[partnerPk].lastTs = event.created_at
-          }
-        }
-
-        // Load profiles for each partner
-        for (const partnerPk of Object.keys(convMap)) {
-          const cached = await getProfile(partnerPk)
-          if (cached) {
-            convMap[partnerPk].profile = cached
-          } else {
-            // Fetch profile in background
-            pool.querySync(relays, { kinds: [0], authors: [partnerPk], limit: 1 })
-              .then(events => {
-                if (events.length) {
-                  const p = JSON.parse(events[0].content)
-                  saveProfile(partnerPk, p)
-                  setConversations(prev => ({
-                    ...prev,
-                    [partnerPk]: { ...prev[partnerPk], profile: p }
-                  }))
-                }
-              }).catch(() => {})
-          }
-        }
-
-        setConversations(convMap)
-        try { localStorage.setItem(CACHE_KEY, JSON.stringify(convMap)) } catch {}
-      } catch(e) {
-        setError('Could not load messages. Check your connection.')
-        console.error('[bitsoko] messages error:', e)
-      }
+    let sk, skHex
+    try {
+      sk    = getSecretKey()
+      skHex = skToHex(sk)
+    } catch {
+      setError('Could not load keys')
       setLoading(false)
+      return
     }
 
-    load()
+    const relays = [...new Set([...getReadRelays(), ...DEFAULT_RELAYS])]
+    let doneCount = 0
+    const totalRelays = relays.length
+
+    const onEvent = async (event) => {
+      if (seenRef.current.has(event.id)) return
+      seenRef.current.add(event.id)
+
+      const isMe      = event.pubkey === myPubkey
+      const partnerPk = isMe
+        ? (event.tags.find(t => t[0] === 'p')?.[1] || '')
+        : event.pubkey
+      if (!partnerPk) return
+
+      let text = '[encrypted message]'
+      try { text = await nip04.decrypt(skHex, partnerPk, event.content) } catch {}
+
+      const msg = { id: event.id, text, ts: event.created_at, isMe }
+
+      if (!convRef.current[partnerPk]) {
+        convRef.current[partnerPk] = { messages: [], lastTs: 0, profile: null }
+        // Fetch profile for new conversation partner
+        fetchProfile(partnerPk, relays)
+      }
+
+      const conv     = convRef.current[partnerPk]
+      const existing = conv.messages.findIndex(m => m.id === event.id)
+      if (existing >= 0) return
+
+      conv.messages = [...conv.messages, msg].sort((a, b) => a.ts - b.ts)
+      conv.lastTs   = Math.max(conv.lastTs, event.created_at)
+
+      convRef.current = { ...convRef.current, [partnerPk]: { ...conv } }
+      setConversations({ ...convRef.current })
+
+      // Update bell count on live incoming message
+      const lastSeenTs = getLastSeenTs()
+      const unread = Object.values(convRef.current).filter(c => {
+        const lastMsg = c.messages?.[c.messages.length - 1]
+        return lastMsg && !lastMsg.isMe && lastMsg.ts > lastSeenTs
+      }).length
+      saveUnreadCount(unread)
+    }
+
+    const onDone = () => {
+      doneCount++
+      if (doneCount >= totalRelays) {
+        setLoading(false)
+        try { localStorage.setItem(CACHE_KEY, JSON.stringify(convRef.current)) } catch {}
+
+        // Update bell count after initial fetch
+        const lastSeenTs = getLastSeenTs()
+        const unread = Object.values(convRef.current).filter(c => {
+          const lastMsg = c.messages?.[c.messages.length - 1]
+          return lastMsg && !lastMsg.isMe && lastMsg.ts > lastSeenTs
+        }).length
+        saveUnreadCount(unread)
+        markAllMessagesRead()
+      }
+    }
+
+    // Historical fetch
+    const fSent = { kinds: [4], authors: [myPubkey], limit: 200 }
+    const fRecv = { kinds: [4], '#p': [myPubkey], limit: 200 }
+    const fetchClosers = relays.map(r =>
+      fetchDMsFromRelay(r, sk, fSent, fRecv, onEvent, onDone)
+    )
+
+    // Live subscription — stays open and auto-reconnects
+    const now    = Math.floor(Date.now() / 1000)
+    const lSent  = { kinds: [4], authors: [myPubkey], since: now }
+    const lRecv  = { kinds: [4], '#p': [myPubkey], since: now }
+    const liveClosers = relays.map(r =>
+      subscribeLiveDMs(r, sk, lSent, lRecv, onEvent)
+    )
+    liveClosersRef.current = liveClosers
+
+    return () => {
+      fetchClosers.forEach(c => c?.())
+      liveClosers.forEach(c => c?.())
+    }
   }, [myPubkey])
 
-  // Scroll to bottom when conversation opens or messages update
+  // ── Profile fetcher ─────────────────────────
+  const fetchProfile = async (pubkey, relays) => {
+    try {
+      const cached = await getProfile(pubkey)
+      if (cached) {
+        convRef.current[pubkey] = { ...convRef.current[pubkey], profile: cached }
+        setConversations({ ...convRef.current })
+        return
+      }
+      const pool   = getPool()
+      const events = await pool.querySync(relays, { kinds: [0], authors: [pubkey], limit: 1 })
+      if (events.length) {
+        const p = JSON.parse(events[0].content)
+        await saveProfile(pubkey, p)
+        convRef.current[pubkey] = { ...convRef.current[pubkey], profile: p }
+        setConversations({ ...convRef.current })
+      }
+    } catch {}
+  }
+
   useEffect(() => {
     if (selected && bottomRef.current) {
       bottomRef.current.scrollIntoView({ behavior: 'smooth' })
     }
   }, [selected, conversations])
 
-  // ── Send a reply ───────────────────────────
   const handleSend = async () => {
     if (!input.trim() || !selected || sending) return
     setSending(true)
@@ -224,41 +345,41 @@ export default function Messages() {
     setInput('')
 
     try {
-      const sk     = getSecretKey()
-      const skHex  = skToHex(sk)
+      const sk        = getSecretKey()
+      const skHex     = skToHex(sk)
       const encrypted = await nip04.encrypt(skHex, selected, text)
 
       const event = finalizeEvent({
-        kind: 4,
+        kind:       4,
         created_at: Math.floor(Date.now() / 1000),
-        tags: [['p', selected]],
-        content: encrypted,
+        tags:       [['p', selected]],
+        content:    encrypted,
       }, sk)
 
       const relays = [...new Set([...getWriteRelays(), ...DEFAULT_RELAYS])]
       await Promise.any(getPool().publish(relays, event))
 
       // Optimistic update
-      setConversations(prev => ({
-        ...prev,
-        [selected]: {
-          ...prev[selected],
-          messages: [...(prev[selected]?.messages || []), { id: event.id, text, ts: event.created_at, isMe: true }],
-          lastTs: event.created_at,
-        }
-      }))
+      const msg = { id: event.id, text, ts: event.created_at, isMe: true }
+      if (!convRef.current[selected]) {
+        convRef.current[selected] = { messages: [], lastTs: 0, profile: null }
+      }
+      convRef.current[selected].messages = [...convRef.current[selected].messages, msg]
+      convRef.current[selected].lastTs   = event.created_at
+      seenRef.current.add(event.id)
+      setConversations({ ...convRef.current })
+
     } catch(e) {
-      setInput(text) // restore on failure
+      setInput(text)
       console.error('[bitsoko] send DM error:', e)
     }
     setSending(false)
   }
 
-  const sortedConvs = Object.entries(conversations).sort((a, b) => b[1].lastTs - a[1].lastTs)
+  const sortedConvs  = Object.entries(conversations).sort((a, b) => b[1].lastTs - a[1].lastTs)
   const selectedConv = selected ? conversations[selected] : null
   const partnerName  = selectedConv?.profile?.display_name || selectedConv?.profile?.name || `${selected?.slice(0,8)}…`
 
-  // ── No account ─────────────────────────────
   if (!myPubkey) {
     return (
       <div style={{ minHeight: '100vh', background: C.bg, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 12, padding: 24, textAlign: 'center' }}>
@@ -269,12 +390,11 @@ export default function Messages() {
     )
   }
 
-  // ── Conversation thread view ───────────────
+  // ── Thread view ─────────────────────────────
   if (selected && selectedConv) {
     return (
       <div style={{ background: C.bg, minHeight: '100vh', fontFamily: "'Inter',sans-serif", display: 'flex', flexDirection: 'column' }}>
 
-        {/* Thread header */}
         <div style={{ background: C.white, borderBottom: `1px solid ${C.border}`, padding: '14px 16px', display: 'flex', alignItems: 'center', gap: 12, position: 'sticky', top: 0, zIndex: 50, flexShrink: 0 }}>
           <button onClick={() => setSelected(null)} style={{ background: 'none', border: 'none', cursor: 'pointer', display: 'flex', alignItems: 'center', color: C.black, padding: 4 }}>
             <ChevronLeft size={22}/>
@@ -288,7 +408,6 @@ export default function Messages() {
           </div>
         </div>
 
-        {/* Messages */}
         <div style={{ flex: 1, overflowY: 'auto', padding: '16px 16px 80px' }}>
           {selectedConv.messages.map(msg => (
             <Bubble key={msg.id} text={msg.text} ts={msg.ts} isMe={msg.isMe}/>
@@ -296,7 +415,6 @@ export default function Messages() {
           <div ref={bottomRef}/>
         </div>
 
-        {/* Input bar */}
         <div style={{ position: 'fixed', bottom: 64, left: 0, right: 0, background: C.white, borderTop: `1px solid ${C.border}`, padding: '12px 16px', display: 'flex', gap: 10, alignItems: 'flex-end' }}>
           <textarea
             value={input}
@@ -334,11 +452,10 @@ export default function Messages() {
     )
   }
 
-  // ── Conversation list ──────────────────────
+  // ── Conversation list ───────────────────────
   return (
     <div style={{ background: C.bg, minHeight: '100vh', fontFamily: "'Inter',sans-serif", paddingBottom: 100 }}>
 
-      {/* Header */}
       <div style={{ background: C.white, borderBottom: `1px solid ${C.border}`, padding: '16px 20px', display: 'flex', alignItems: 'center', gap: 14, position: 'sticky', top: 0, zIndex: 50 }}>
         <button onClick={() => navigate('/', { state: { openMore: true } })} style={{ width: 36, height: 36, borderRadius: '50%', background: C.bg, border: `1px solid ${C.border}`, display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer' }}>
           <ArrowLeft size={17} color={C.black}/>
