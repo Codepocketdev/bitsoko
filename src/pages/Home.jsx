@@ -9,8 +9,6 @@ import {
 import { openDB, getProducts, getProfile, getProfiles } from '../lib/db'
 import { fetchAndSeed, startSync, stopSync, getPublicKeyHex } from '../lib/nostrSync'
 import { useNostrProfile } from '../hooks/useNostrProfile'
-import { useNotifications } from '../hooks/useNotifications'
-import { satsToKsh, useRate } from '../lib/rates'
 
 const C = {
   bg:     '#f7f4f0',
@@ -24,6 +22,8 @@ const C = {
   sage:   '#2d6a4f',
 }
 
+// FIX: tag values now match p.categories exactly (full names from db.js saveProduct)
+// Old tags were lowercase short ('electronics', 'food') — never matched p.categories
 const CATEGORIES = [
   { icon: Smartphone, label: 'Electronics',  tag: 'Electronics'   },
   { icon: Shirt,      label: 'Fashion',      tag: 'Fashion'       },
@@ -37,6 +37,12 @@ const CATEGORIES = [
 
 const PAGE_SIZE   = 20
 const DEBOUNCE_MS = 300
+
+function satsToKsh(sats) {
+  const ksh = (sats / 100_000_000) * 13_000_000
+  if (ksh >= 1000) return `KSh ${(ksh / 1000).toFixed(1)}k`
+  return `KSh ${Math.round(ksh)}`
+}
 
 function timeAgo(ts) {
   const s = Math.floor(Date.now() / 1000) - ts
@@ -68,12 +74,12 @@ function Avatar({ profile, pubkey, size = 36 }) {
   )
 }
 
-function ProductCard({ product, profile, onClick, rate }) {
+function ProductCard({ product, profile, onClick }) {
   const image      = product.images?.[0]
   const name       = product.name  || 'Untitled'
   const price      = product.price || 0
   const sellerName = profile?.name || profile?.display_name || product.pubkey?.slice(0, 8) + '…'
-  const [imgErr, setImgErr] = useState(false)
+  const [imgErr,   setImgErr] = useState(false)
 
   return (
     <div onClick={onClick} style={{
@@ -112,7 +118,7 @@ function ProductCard({ product, profile, onClick, rate }) {
           {name}
         </div>
         <div style={{ fontFamily: "'Inter',sans-serif", fontSize: 11, color: C.muted, marginBottom: 6 }}>
-          {satsToKsh(price, rate)}
+          {satsToKsh(price)}
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
           <Avatar profile={profile} pubkey={product.pubkey} size={16}/>
@@ -127,7 +133,6 @@ function ProductCard({ product, profile, onClick, rate }) {
 
 export default function Home() {
   const navigate = useNavigate()
-  const rate     = useRate()
 
   const [products,     setProducts]     = useState([])
   const [profiles,     setProfiles]     = useState({})
@@ -142,11 +147,6 @@ export default function Home() {
 
   const _pubkeyHex = (() => { try { return getPublicKeyHex() } catch { return '' } })()
   const { profile: _userProfile } = useNostrProfile(_pubkeyHex)
-
-  // ── Notifications ─────────────────────────
-  const { unreadCount } = useNotifications()
-
-  const handleBellClick = () => navigate('/messages')
 
   const [displayName, setDisplayName] = useState(
     () => localStorage.getItem('bitsoko_display_name') || null
@@ -172,8 +172,10 @@ export default function Home() {
     return () => window.removeEventListener('bitsoko_login', onLogin)
   }, [])
 
+  // Reset pagination when filter/search changes
   useEffect(() => { setVisibleCount(PAGE_SIZE) }, [selectedCat, searchQuery])
 
+  // ── Debounced DB reload ───────────────────
   const debouncedReload = useCallback(async () => {
     if (debounceTimer.current) clearTimeout(debounceTimer.current)
     debounceTimer.current = setTimeout(async () => {
@@ -187,6 +189,7 @@ export default function Home() {
     }, DEBOUNCE_MS)
   }, [])
 
+  // ── Banners ───────────────────────────────
   const BANNERS = [
     { bg: '#e8614a', accent: '#fdf0e8', tag: 'LIGHTNING DEALS',   title: 'Pay with sats,\npay in seconds',       cta: 'Browse deals',  path: '/deals',          bubble: 'rgba(253,240,232,0.15)' },
     { bg: '#f5a623', accent: '#1a1410', tag: 'BITCOIN PAYMENTS',  title: 'Your storefront.\nOn Bitcoin rails.',   cta: 'Start selling', path: '/create-listing', bubble: 'rgba(26,20,16,0.08)'   },
@@ -200,6 +203,7 @@ export default function Home() {
     return () => clearInterval(t)
   }, [])
 
+  // ── Load from IndexedDB first ─────────────
   const loadFromDB = useCallback(async () => {
     await openDB()
     const saved = await getProducts(500)
@@ -214,14 +218,23 @@ export default function Home() {
     }
   }, [])
 
+  // ── Seed + live sync ──────────────────────
   useEffect(() => {
     let mounted = true
 
     const init = async () => {
-      await loadFromDB()
+      // If toggle was switched, skip DB cache (it was cleared) and go straight to relay
+      const needsResync = localStorage.getItem('bitsoko_needs_resync')
+      if (needsResync) {
+        localStorage.removeItem('bitsoko_needs_resync')
+        setLoading(true)
+      } else {
+        await loadFromDB()
+      }
       setSyncing(true)
 
       await fetchAndSeed({
+        // FIX: debounced — was calling getProducts on every event, dozens per second during seed
         onProduct: () => { if (mounted) debouncedReload() },
         onProfile: (event) => {
           if (!mounted) return
@@ -239,6 +252,7 @@ export default function Home() {
       })
 
       startSync({
+        // FIX: direct state update — no DB round-trip on every live event
         onProduct: async (event) => {
           if (!mounted) return
           if (event._deleted) {
@@ -277,10 +291,13 @@ export default function Home() {
     }
   }, [])
 
+  // ── Filter ────────────────────────────────
+  // FIX: was using raw p.tags array — now uses p.categories (parsed by db.js saveProduct)
   const filtered = products.filter(p => {
     if (p.deleted || p.status === 'deleted') return false
     const tTags = (p.tags || []).filter(t => t[0] === 't').map(t => t[1] || '')
     if (tTags.includes('deleted')) return false
+    // p.categories = already-parsed category names (e.g. 'Electronics', 'Food & Drinks')
     if (selectedCat && !(p.categories || []).includes(selectedCat)) return false
     if (searchQuery) {
       const q = searchQuery.toLowerCase()
@@ -338,27 +355,13 @@ export default function Home() {
             }}>
               <Plus size={17} color={C.white}/>
             </button>
-
-            {/* ── Bell with unread badge ── */}
-            <button onClick={handleBellClick} style={{
+            <button onClick={() => navigate('/messages')} style={{
               width: 36, height: 36, borderRadius: '50%',
               background: C.bg, border: `1px solid ${C.border}`,
               display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer',
               position: 'relative',
             }}>
-              <Bell size={17} color={unreadCount > 0 ? C.orange : C.black}/>
-              {unreadCount > 0 && (
-                <div style={{
-                  position: 'absolute', top: -2, right: -2,
-                  minWidth: 16, height: 16, borderRadius: 99,
-                  background: C.orange, border: `2px solid ${C.white}`,
-                  display: 'flex', alignItems: 'center', justifyContent: 'center',
-                  fontSize: 9, fontWeight: 800, color: C.white,
-                  padding: '0 3px', fontFamily: "'Inter',sans-serif",
-                }}>
-                  {unreadCount > 99 ? '99+' : unreadCount}
-                </div>
-              )}
+              <Bell size={17} color={C.black}/>
             </button>
           </div>
         </div>
@@ -507,11 +510,11 @@ export default function Home() {
                   product={product}
                   profile={profiles[product.pubkey]}
                   onClick={() => navigate(`/product/${product.id}`)}
-                  rate={rate}
                 />
               ))}
             </div>
 
+            {/* Load more */}
             {visibleCount < sorted.length && (
               <button onClick={() => setVisibleCount(c => c + PAGE_SIZE)} style={{
                 width: '100%', marginTop: 16, padding: 14,

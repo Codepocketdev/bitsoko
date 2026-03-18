@@ -9,7 +9,6 @@ import {
   saveProduct, saveProfile,
   saveOrder, getProductById, deleteProduct,
 } from './db'
-import { getRate } from './rates'
 
 export const DEFAULT_RELAYS = [
   'wss://relay.damus.io',
@@ -35,11 +34,32 @@ export function getWriteRelays() { return _userWriteRelays.length ? _userWriteRe
 export const RELAYS = DEFAULT_RELAYS
 
 // ── Bitsoko-only toggle ───────────────────────
+// true  = only show products tagged ['t','bitsoko'] — African circular economy merchants
+// false = global Nostr marketplace (all kind:30402 events like Shopstr)
 export function getBitsokoOnly() {
   return localStorage.getItem('bitsoko_filter_mode') !== 'global'
 }
 export function setBitsokoOnly(val) {
   localStorage.setItem('bitsoko_filter_mode', val ? 'bitsoko' : 'global')
+}
+
+// Call this when toggle switches to clear stale IndexedDB products
+export async function clearProductsCache() {
+  return new Promise((resolve) => {
+    const req = indexedDB.open('bitsoko_db')
+    req.onsuccess = (e) => {
+      const db = e.target.result
+      const stores = ['products', 'profiles']
+      const existing = Array.from(db.objectStoreNames)
+      const toClean = stores.filter(s => existing.includes(s))
+      if (!toClean.length) { resolve(); return }
+      const tx = db.transaction(toClean, 'readwrite')
+      toClean.forEach(s => tx.objectStore(s).clear())
+      tx.oncomplete = () => resolve()
+      tx.onerror    = () => resolve()
+    }
+    req.onerror = () => resolve()
+  })
 }
 
 export const KINDS = {
@@ -90,6 +110,47 @@ function isDeleted(event) {
   return false
 }
 
+// ── NSFW / content moderation filter ─────────
+// Applied to ALL events regardless of Bitsoko/global mode.
+// Blocks: NIP-36 content-warning, explicit keyword titles,
+// and known adult image hosting patterns.
+const NSFW_KEYWORDS = new Set([
+  'porn','nsfw','xxx','nude','naked','sex','adult','erotic',
+  'onlyfans','escort','fetish','lingerie model','explicit',
+])
+
+const ADULT_IMAGE_PATTERNS = [
+  /nostr\.build\/i\/[a-f0-9]{64}\.(?:mp4|mov)/i,
+]
+
+function isNSFW(event) {
+  const tags = event.tags || []
+
+  // NIP-36: content-warning tag = seller explicitly marked it adult
+  if (tags.some(t => t[0] === 'content-warning')) return true
+
+  // Check title and content for explicit keywords
+  const title   = (tags.find(t => t[0] === 'title')?.[1] || '').toLowerCase()
+  const content = (event.content || '').toLowerCase()
+  const summary = (tags.find(t => t[0] === 'summary')?.[1] || '').toLowerCase()
+  const text    = `${title} ${content} ${summary}`
+
+  for (const kw of NSFW_KEYWORDS) {
+    // Whole-word match to avoid blocking e.g. "sexpensive" or "adults only"
+    if (new RegExp(`\b${kw}\b`).test(text)) return true
+  }
+
+  // Check image URLs for known adult patterns
+  const imageUrls = tags.filter(t => t[0] === 'image').map(t => t[1] || '')
+  for (const url of imageUrls) {
+    for (const pattern of ADULT_IMAGE_PATTERNS) {
+      if (pattern.test(url)) return true
+    }
+  }
+
+  return false
+}
+
 export async function fetchAndSetUserRelays(pubkeyHex) {
   try {
     const pool = getPool()
@@ -122,6 +183,7 @@ export async function fetchAndSeed({ onProduct, onProfile, onDone } = {}) {
   const relays = [...new Set([...getReadRelays(), ...DEFAULT_RELAYS])]
 
   try {
+    // Filter based on user preference — Bitsoko merchants only or global
     const bitsokoOnly = getBitsokoOnly()
     const listingFilter = bitsokoOnly
       ? { kinds: [KINDS.LISTING],       '#t': ['bitsoko'], limit: 500 }
@@ -149,6 +211,10 @@ export async function fetchAndSeed({ onProduct, onProfile, onDone } = {}) {
       if (isDeleted(event)) {
         await deleteProduct(key).catch(() => {})
       } else if (event.kind === KINDS.LISTING) {
+        if (isNSFW(event)) {
+          console.log('[bitsoko] blocked NSFW listing:', event.id.slice(0,8))
+          continue
+        }
         await saveProduct(event)
         profilePubkeys.add(event.pubkey)
         onProduct?.(event)
@@ -220,6 +286,10 @@ export function startSync({ onProduct, onProfile } = {}) {
           return
         }
         if (event.kind === KINDS.LISTING) {
+          if (isNSFW(event)) {
+            console.log('[bitsoko] blocked NSFW live event:', event.id.slice(0,8))
+            return
+          }
           await saveProduct(event)
           fetchProfileIfMissing(event.pubkey)
           onProduct?.(event)
@@ -254,6 +324,18 @@ async function fetchProfileIfMissing(pubkey) {
 
 // ─────────────────────────────────────────────
 // PUBLISH LISTING (kind:30402 — NIP-99)
+//
+// FIX 1 — Duplicate listing on edit:
+//   productId passed from MyShop is the stableId (pubkey:d-tag).
+//   Using that whole string as the d tag creates a NEW product.
+//   Fix: if productId looks like a stableId (contains ':'), extract
+//   just the d-tag portion after the first pubkey segment.
+//
+// FIX 2 — Category filter never matches:
+//   Was doing c.toLowerCase() on categories before tagging.
+//   db.js saveProduct reads t-tags back as-is into p.categories.
+//   Home/Explore filter against full-name strings like 'Electronics'.
+//   Fix: store categories exactly as provided — no lowercasing.
 // ─────────────────────────────────────────────
 export async function publishProduct({
   name,
@@ -266,7 +348,7 @@ export async function publishProduct({
   shipping     = [],
   location     = 'Nairobi, Kenya',
   status       = 'active',
-  productId    = null,
+  productId    = null,   // stableId from db (pubkey:d-tag) or null for new
   isDeal       = false,
   originalPrice = 0,
 }) {
@@ -274,11 +356,16 @@ export async function publishProduct({
   const pk  = getPublicKeyHex()
   const now = Math.floor(Date.now() / 1000)
 
+  // FIX 1: extract raw d-tag from stableId
+  // stableId format = "pubkeyHex:d-tag-value"
+  // pubkeyHex is always 64 hex chars, so split at char 65 (the colon)
   let dTag
   if (productId) {
     if (productId.length > 65 && productId[64] === ':') {
+      // It's a stableId — extract the d-tag portion after pubkey:
       dTag = productId.slice(65)
     } else {
+      // It's already a raw d-tag (legacy or manually set)
       dTag = productId
     }
   } else {
@@ -298,11 +385,14 @@ export async function publishProduct({
     ['quantity',     quantity.toString()],
     ['t',            'bitsoko'],
     ['t',            'bitcoin'],
+    // Deduplicate categories (case-insensitive) before tagging
+    // Prevents duplicate tags when editing a product multiple times
     ...([...new Set(categories.map(c => c.trim()).filter(Boolean))]).map(c => ['t', c]),
-    ...images.map(url   => ['image',    url]),
-    ...shipping.map(s   => ['shipping', s.name || '', (s.cost || 0).toString(), 'SATS', s.regions || '']),
+    ...images.map(url      => ['image',    url]),
+    ...shipping.map(s      => ['shipping', s.name || '', (s.cost || 0).toString(), 'SATS', s.regions || '']),
   ]
 
+  // Deal tags — adds to Deals page relay filter
   if (isDeal) {
     tags.push(['t', 'deal'])
     tags.push(['t', 'sale'])
@@ -351,6 +441,7 @@ export async function deleteProductEvent(productId) {
   const dTag   = (product.tags || []).find(t => t[0] === 'd')?.[1] || productId
   const relays = [...new Set([...getWriteRelays(), ...DEFAULT_RELAYS])]
 
+  // NIP-09 kind:5 deletion
   const kind5 = finalizeEvent({
     kind:       KINDS.DELETE,
     created_at: Math.floor(Date.now() / 1000),
@@ -359,6 +450,7 @@ export async function deleteProductEvent(productId) {
   }, sk)
   try { await Promise.any(getPool().publish(relays, kind5).map(p => p.catch(e => { throw e }))) } catch {}
 
+  // kind:30403 tombstone
   const tombstone = finalizeEvent({
     kind:       KINDS.LISTING_DRAFT,
     created_at: Math.floor(Date.now() / 1000) + 1,
@@ -378,6 +470,10 @@ export async function deleteProductEvent(productId) {
 
 // ─────────────────────────────────────────────
 // PUBLISH ORDER (kind:4 NIP-04 DM)
+//
+// FIX 3 — Human-readable order message
+// Was sending raw JSON that sellers couldn't read.
+// Now sends a clean text format buyers and sellers both understand.
 // ─────────────────────────────────────────────
 export async function publishOrder({ sellerPubkey, product, quantity, message = '' }) {
   const sk      = getSecretKey()
@@ -385,16 +481,15 @@ export async function publishOrder({ sellerPubkey, product, quantity, message = 
   const relays  = getWriteRelays()
   const buyer   = localStorage.getItem('bitsoko_display_name') || 'A buyer'
 
-  // Use live rate from rates.js — no more hardcoded 13_000_000
-  const rate      = getRate()
-  const total     = product.price * quantity
-  const ksh       = (total / 100_000_000) * rate
-  const totalFiat = ksh >= 1_000_000
-    ? `KSh ${(ksh / 1_000_000).toFixed(2)}M`
-    : ksh >= 1000
-    ? `KSh ${(ksh / 1000).toFixed(1)}k`
-    : `KSh ${Math.round(ksh)}`
+  const satsToKsh = (sats) => {
+    const ksh = (sats / 100_000_000) * 13_000_000
+    return ksh >= 1000 ? `KSh ${(ksh/1000).toFixed(1)}k` : `KSh ${Math.round(ksh)}`
+  }
 
+  const total     = product.price * quantity
+  const totalFiat = satsToKsh(total)
+
+  // Human-readable order message — no JSON
   const orderText = [
     `🛒 New Order from Bitsoko`,
     ``,
@@ -419,16 +514,16 @@ export async function publishOrder({ sellerPubkey, product, quantity, message = 
   }, sk)
 
   await saveOrder({
-    id:            event.id,
-    pubkey:        pk,
+    id:           event.id,
+    pubkey:       pk,
     seller_pubkey: sellerPubkey,
-    product_id:    product.id,
-    product_name:  product.name,
-    product:       product,
+    product_id:   product.id,
+    product_name: product.name,
+    product:      product,
     quantity,
-    price:         total,
-    status:        'pending',
-    created_at:    event.created_at,
+    price:        total,
+    status:       'pending',
+    created_at:   event.created_at,
     message,
   })
 

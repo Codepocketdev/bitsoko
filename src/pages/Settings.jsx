@@ -5,7 +5,7 @@ import {
   LogOut, ChevronRight, Shield, Zap, Info,
   Copy, Check, RefreshCw, Github,
 } from 'lucide-react'
-import { DEFAULT_RELAYS, getSecretKey, getPublicKeyHex, getPool, getWriteRelays, getBitsokoOnly, setBitsokoOnly } from '../lib/nostrSync'
+import { DEFAULT_RELAYS, getSecretKey, getPublicKeyHex, getPool, getWriteRelays, getBitsokoOnly, setBitsokoOnly, clearProductsCache } from '../lib/nostrSync'
 import { finalizeEvent } from 'nostr-tools/pure'
 import { openDB } from '../lib/db'
 
@@ -48,11 +48,13 @@ export default function Settings() {
   const npub      = localStorage.getItem('bitsoko_npub') || ''
   const shortNpub = npub ? `${npub.slice(0,12)}…${npub.slice(-6)}` : 'Not set'
 
-  const toggleMarketplace = (val) => {
+  const toggleMarketplace = async (val) => {
     setBitsokoOnly(val)
     setBitsokoOnlyState(val)
-    // Clear cache so it re-fetches with new filter
-    localStorage.removeItem('bitsoko_products_cache')
+    // Clear IndexedDB products + profiles so stale content is gone
+    await clearProductsCache()
+    // Signal Home to re-sync on next render
+    localStorage.setItem('bitsoko_needs_resync', '1')
   }
 
   const saveLnAddress = async () => {
