@@ -43,9 +43,55 @@ const FIELDS = [
   { key: 'lud16',        label: 'Lightning Address', icon: Zap,      placeholder: 'you@wallet.com',       type: 'text'     },
 ]
 
+// ── Live kind:0 WebSocket — stays open, auto-reconnects ──
+// Calls onProfile(parsedContent) whenever a newer kind:0 arrives
+function subscribeProfile(pubkeyHex, onProfile) {
+  const closers = []
+
+  FETCH_RELAYS.forEach(relayUrl => {
+    let ws, closed = false, latestTs = 0
+
+    const connect = () => {
+      if (closed) return
+      try {
+        ws = new WebSocket(relayUrl)
+        const subId = 'prof-' + Math.random().toString(36).slice(2, 8)
+
+        ws.onopen = () => {
+          if (closed) return
+          ws.send(JSON.stringify(['REQ', subId,
+            { kinds: [0], authors: [pubkeyHex], limit: 1 }
+          ]))
+        }
+
+        ws.onmessage = ({ data }) => {
+          if (closed) return
+          let msg
+          try { msg = JSON.parse(data) } catch { return }
+          const [type, , event] = msg
+          if (type === 'EVENT' && event?.kind === 0 && event.pubkey === pubkeyHex) {
+            // Only apply newer events
+            if (event.created_at > latestTs) {
+              latestTs = event.created_at
+              try { onProfile(JSON.parse(event.content), event.created_at) } catch {}
+            }
+          }
+        }
+
+        ws.onerror = () => {}
+        ws.onclose = () => { if (!closed) setTimeout(connect, 5000) }
+      } catch { if (!closed) setTimeout(connect, 5000) }
+    }
+
+    connect()
+    closers.push(() => { closed = true; try { ws?.close() } catch {} })
+  })
+
+  return () => closers.forEach(c => c())
+}
+
 export default function Profile() {
   const navigate = useNavigate()
-  const subRef   = useRef(null)
 
   const [pubkeyHex, setPubkeyHex] = useState(() => {
     try { return getPublicKeyHex() } catch { return '' }
@@ -95,40 +141,36 @@ export default function Profile() {
   useEffect(() => {
     if (!pubkeyHex) { setFetchStatus('empty'); return }
 
-    // Step 1: IndexedDB instantly
+    // Step 1: Load from IndexedDB instantly
     getProfile(pubkeyHex).then(cached => {
-      if (cached && (cached.name || cached.display_name || cached.about)) {
+      if (cached && (cached.name || cached.display_name || cached.about || cached.picture)) {
         fillForm(cached)
       } else {
+        // Fallback: use locally stored values while relay loads
         const n = localStorage.getItem('bitsoko_display_name')
         const l = localStorage.getItem('bitsoko_ln')
         if (n) setForm(prev => ({ ...prev, display_name: n, name: n }))
         if (l) setForm(prev => ({ ...prev, lud16: l }))
+        setFetchStatus('loading')
       }
     }).catch(() => {})
 
-    // Step 2: Background relay refresh
-    const pool = new SimplePool()
-    const sub  = pool.subscribe(
-      FETCH_RELAYS,
-      [{ kinds: [0], authors: [pubkeyHex], limit: 1 }],
-      {
-        onevent(e) {
-          try { const p = JSON.parse(e.content); fillForm(p); saveProfile(pubkeyHex, p).catch(() => {}) } catch {}
-        },
-        oneose() {
-          try { sub.close() } catch {}
-          setFetchStatus(prev => prev === 'loading' ? 'empty' : prev)
-        },
-      }
-    )
-    subRef.current = sub
-    const t = setTimeout(() => {
-      try { sub.close() } catch {}
+    // Step 2: Live WebSocket subscription — stays open, updates on any relay push
+    const stopTimeout = setTimeout(() => {
       setFetchStatus(prev => prev === 'loading' ? 'empty' : prev)
     }, 10000)
 
-    return () => { clearTimeout(t); try { subRef.current?.close() } catch {} }
+    const unsubscribe = subscribeProfile(pubkeyHex, async (profile, createdAt) => {
+      clearTimeout(stopTimeout)
+      fillForm(profile)
+      // Save to IndexedDB with createdAt so stale profiles don't overwrite fresh ones
+      await saveProfile(pubkeyHex, profile, createdAt).catch(() => {})
+    })
+
+    return () => {
+      clearTimeout(stopTimeout)
+      unsubscribe()
+    }
   }, [pubkeyHex])
 
   const set = (key, val) => setForm(prev => ({ ...prev, [key]: val }))
@@ -140,9 +182,10 @@ export default function Profile() {
       const pool   = new SimplePool()
       const events = await pool.querySync(FETCH_RELAYS, { kinds: [0], authors: [pubkeyHex], limit: 1 })
       if (!events.length) throw new Error('No profile found on relays')
+      events.sort((a, b) => b.created_at - a.created_at)
       const p = JSON.parse(events[0].content)
       fillForm(p)
-      await saveProfile(pubkeyHex, p)
+      await saveProfile(pubkeyHex, p, events[0].created_at)
     } catch (e) { setError(e.message || 'Refresh failed') }
     setRefreshing(false)
   }
@@ -158,8 +201,8 @@ export default function Profile() {
         kind: 0, created_at: Math.floor(Date.now() / 1000),
         tags: [], content: JSON.stringify(payload),
       }, sk)
-      await Promise.any(new SimplePool().publish(relays, event))
-      await saveProfile(pubkeyHex, payload)
+      await Promise.any(new SimplePool().publish(relays, event).map(p => p.catch(e => { throw e })))
+      await saveProfile(pubkeyHex, payload, event.created_at)
       fillForm(payload)
       window.dispatchEvent(new Event('bitsoko_login'))
       setSaved(true)
@@ -187,27 +230,13 @@ export default function Profile() {
     <div style={{ minHeight: '100vh', background: C.bg, paddingBottom: 100 }}>
 
       {/* Top bar */}
-      <div style={{
-        position: 'sticky', top: 0, zIndex: 50,
-        background: C.white, borderBottom: `1px solid ${C.border}`,
-        display: 'flex', alignItems: 'center', gap: 12, padding: '14px 16px',
-      }}>
-        {/* FIX: was navigate('/', {state:{openMore:true}}) — loaded entire Home page
-            causing 2-second delay. navigate('/', { state: { openMore: true } }) is instant. */}
-        <button onClick={() => navigate('/', { state: { openMore: true } })} style={{
-          width: 36, height: 36, borderRadius: '50%', border: `1px solid ${C.border}`,
-          background: C.bg, cursor: 'pointer',
-          display: 'flex', alignItems: 'center', justifyContent: 'center',
-        }}>
+      <div style={{ position: 'sticky', top: 0, zIndex: 50, background: C.white, borderBottom: `1px solid ${C.border}`, display: 'flex', alignItems: 'center', gap: 12, padding: '14px 16px' }}>
+        <button onClick={() => navigate('/', { state: { openMore: true } })} style={{ width: 36, height: 36, borderRadius: '50%', border: `1px solid ${C.border}`, background: C.bg, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
           <ArrowLeft size={18} color={C.black}/>
         </button>
         <span style={{ fontSize: 17, fontWeight: 800, color: C.black, flex: 1 }}>My Profile</span>
         <div style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
-          <div style={{
-            width: 7, height: 7, borderRadius: '50%',
-            background: fetchStatus === 'found' ? C.sage : fetchStatus === 'loading' ? C.orange : C.muted,
-            animation: fetchStatus === 'loading' ? 'pulse 1.2s ease-in-out infinite' : 'none',
-          }}/>
+          <div style={{ width: 7, height: 7, borderRadius: '50%', background: fetchStatus === 'found' ? C.sage : fetchStatus === 'loading' ? C.orange : C.muted, animation: fetchStatus === 'loading' ? 'pulse 1.2s ease-in-out infinite' : 'none' }}/>
           <span style={{ fontSize: 11, color: C.muted }}>
             {fetchStatus === 'found' ? 'Loaded' : fetchStatus === 'loading' ? 'Fetching…' : 'New'}
           </span>
@@ -218,20 +247,13 @@ export default function Profile() {
       <div style={{ background: C.white, padding: '20px 16px', marginBottom: 10, borderBottom: `1px solid ${C.border}` }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
           <label style={{ cursor: 'pointer', position: 'relative', flexShrink: 0 }}>
-            <div style={{
-              width: 76, height: 76, borderRadius: '50%',
-              background: `linear-gradient(135deg, ${C.orange}, ${C.terra})`,
-              border: `3px solid ${C.bg}`, boxShadow: '0 2px 12px rgba(0,0,0,0.1)',
-              display: 'flex', alignItems: 'center', justifyContent: 'center',
-              fontSize: 24, fontWeight: 900, color: '#fff', overflow: 'hidden',
-            }}>
+            <div style={{ width: 76, height: 76, borderRadius: '50%', background: `linear-gradient(135deg, ${C.orange}, ${C.terra})`, border: `3px solid ${C.bg}`, boxShadow: '0 2px 12px rgba(0,0,0,0.1)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 24, fontWeight: 900, color: '#fff', overflow: 'hidden' }}>
               {avatar
                 ? <img src={avatar} alt="" style={{ width: '100%', height: '100%', objectFit: 'cover' }} onError={e => e.target.style.display = 'none'}/>
                 : dispName.slice(0, 2).toUpperCase()
               }
             </div>
-            <input type="file" accept="image/*" style={{ display: 'none' }}
-              onChange={e => handleUpload('picture', e.target.files?.[0])}/>
+            <input type="file" accept="image/*" style={{ display: 'none' }} onChange={e => handleUpload('picture', e.target.files?.[0])}/>
           </label>
 
           <div style={{ flex: 1, minWidth: 0 }}>
@@ -330,15 +352,7 @@ export default function Profile() {
           <div style={{ background: 'rgba(239,68,68,0.08)', border: '1px solid rgba(239,68,68,0.25)', borderRadius: 10, padding: '10px 14px', marginBottom: 14, fontSize: 13, color: C.red }}>{error}</div>
         )}
 
-        {/* Save button — consistent black, grey on success */}
-        <button onClick={handleSave} disabled={saving} style={{
-          width: '100%', padding: 16, borderRadius: 14, border: 'none',
-          background: saved ? '#9e9890' : C.black,
-          color: '#fff', fontWeight: 700, fontSize: 15,
-          cursor: saving ? 'default' : 'pointer',
-          display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 10,
-          opacity: saving ? 0.7 : 1, transition: 'background 0.3s',
-        }}>
+        <button onClick={handleSave} disabled={saving} style={{ width: '100%', padding: 16, borderRadius: 14, border: 'none', background: saved ? '#9e9890' : C.black, color: '#fff', fontWeight: 700, fontSize: 15, cursor: saving ? 'default' : 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 10, opacity: saving ? 0.7 : 1, transition: 'background 0.3s' }}>
           {saving
             ? <><div style={{ width: 16, height: 16, borderRadius: '50%', border: '2px solid rgba(255,255,255,0.4)', borderTopColor: '#fff', animation: 'spin .7s linear infinite' }}/> Publishing…</>
             : saved
