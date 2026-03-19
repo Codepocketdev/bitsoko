@@ -9,7 +9,7 @@ import { CashuMint, CashuWallet, getEncodedToken, getDecodedToken } from '@cashu
 export const DEFAULT_MINT_URL  = 'https://mint.minibits.cash/Bitcoin'
 export const BITSOKO_FEE_LUD16 = 'hodlcurator@blink.sv'
 export const BITSOKO_FEE_PCT   = 0.02
-export const BITSOKO_MIN_FEE   = 1
+export const BITSOKO_MIN_FEE   = 1  // actual min sat
 
 // ── Storage ────────────────────────────────────
 export function getWalletData() {
@@ -59,6 +59,21 @@ async function createWallet(mintUrl) {
 }
 
 // ── MINT ───────────────────────────────────────
+// Estimate how much to mint to cover product price + Lightning routing fee reserve
+// We pre-fetch a dummy melt quote to know the actual fee_reserve for this mint
+export async function estimateMintAmount(productPriceSats, sellerLud16, mintUrl) {
+  try {
+    const { wallet } = await createWallet(mintUrl)
+    const invoice    = await fetchLnurlInvoice(sellerLud16, productPriceSats)
+    const quote      = await wallet.createMeltQuote(invoice)
+    // Total proofs needed = product amount + routing reserve
+    return quote.amount + quote.fee_reserve
+  } catch {
+    // Fallback: add 2 sat buffer if estimation fails
+    return productPriceSats + 2
+  }
+}
+
 // SatoshiPay: wallet.mint.createMintQuote({ amount, unit })
 export async function createMintInvoice(amountSats, mintUrl) {
   const { wallet, url } = await createWallet(mintUrl)
@@ -225,22 +240,75 @@ export async function fetchLnurlInvoice(lud16, amountSats) {
 }
 
 // ── PURCHASE WITH FEE SPLIT ────────────────────
+// How much to mint when paying via external wallet.
+// Adds a flat 2-sat buffer to cover Lightning routing fee reserves.
+// Any leftover change stays in wallet.
+export function purchaseMintAmount(totalSats) {
+  return totalSats + 2
+}
+
 export async function purchaseWithFeeSplit({ sellerLud16, totalSats, mintUrl, productName = 'Product' }) {
   if (!sellerLud16) throw new Error('Seller has no Lightning address')
-  const feeSats    = Math.max(BITSOKO_MIN_FEE, Math.floor(totalSats * BITSOKO_FEE_PCT))
-  const sellerSats = totalSats - feeSats
 
-  const [sellerInvoice, feeInvoice] = await Promise.all([
-    fetchLnurlInvoice(sellerLud16, sellerSats),
-    fetchLnurlInvoice(BITSOKO_FEE_LUD16, feeSats).catch(() => null),
-  ])
+  const { wallet } = await createWallet(mintUrl)
+  const { tokens } = getWalletData()
+  const balance    = tokens.reduce((s, p) => s + p.amount, 0)
 
-  await payLightningInvoice(sellerInvoice, mintUrl)
-  if (feeInvoice) payLightningInvoice(feeInvoice, mintUrl).catch(() => {})
+  if (balance < totalSats) throw new Error(`Need ${totalSats} sats, wallet has ${balance}`)
+
+  // Step 1: Take our 2% fee FIRST — paid from totalSats
+  const feeSats = Math.floor(totalSats * BITSOKO_FEE_PCT)
+
+  if (feeSats >= 1) {
+    try {
+      const feeInvoice   = await fetchLnurlInvoice(BITSOKO_FEE_LUD16, feeSats)
+      const feeMeltQuote = await wallet.createMeltQuote(feeInvoice)
+      const feeNeeded    = feeMeltQuote.amount + feeMeltQuote.fee_reserve
+
+      const { send: feeProofs, keep: feeKeep } = await wallet.send(feeNeeded, tokens)
+      saveTokens(feeKeep || [])
+
+      const feeMelt = await wallet.meltProofs(feeMeltQuote, feeProofs)
+      const { tokens: afterFee } = getWalletData()
+      saveTokens([...afterFee, ...(feeMelt?.change || [])])
+    } catch(e) {
+      console.warn('[bitsoko] fee payment failed:', e.message)
+    }
+  }
+
+  // Step 2: Pay seller — whatever balance remains after our fee + routing
+  const { tokens: remaining } = getWalletData()
+  const remainingBal = remaining.reduce((s, p) => s + p.amount, 0)
+  if (remainingBal < 1) throw new Error('Insufficient balance for seller payment')
+
+  // Get melt quote to know routing cost, then pay seller net of routing
+  const dummyInvoice   = await fetchLnurlInvoice(sellerLud16, remainingBal)
+  const dummyQuote     = await wallet.createMeltQuote(dummyInvoice)
+  const sellerAmount   = remainingBal - dummyQuote.fee_reserve
+  if (sellerAmount < 1) throw new Error('Amount too low after routing fee')
+
+  const sellerInvoice   = await fetchLnurlInvoice(sellerLud16, sellerAmount)
+  const sellerMeltQuote = await wallet.createMeltQuote(sellerInvoice)
+  const sellerNeeded    = sellerMeltQuote.amount + sellerMeltQuote.fee_reserve
+
+  const { send: sellerProofs, keep: sellerKeep } = await wallet.send(sellerNeeded, remaining)
+  if (!sellerProofs?.length) throw new Error('Failed to prepare proofs')
+  saveTokens(sellerKeep || [])
+
+  const sellerMelt = await wallet.meltProofs(sellerMeltQuote, sellerProofs)
+  if (!sellerMelt?.quote || sellerMelt.quote.state !== 'PAID') {
+    const { tokens: cur } = getWalletData()
+    saveTokens([...cur, ...sellerProofs])
+    throw new Error('Seller payment failed')
+  }
+
+  const { tokens: afterSeller } = getWalletData()
+  saveTokens([...afterSeller, ...(sellerMelt.change || [])])
 
   addHistory({ type: 5, amount: totalSats, label: productName, date: Math.floor(Date.now() / 1000) })
-  return { success: true, sellerSats, feeSats }
+  return { success: true, sellerSats: sellerAmount, feeSats }
 }
+
 
 export function clearWallet() {
   localStorage.removeItem('bitsoko_wallet_tokens')
