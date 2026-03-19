@@ -8,7 +8,7 @@ import {
 } from 'lucide-react'
 import { getProductsByPubkey, saveProduct, getProfile } from '../lib/db'
 import { publishProduct, deleteProductEvent, getPool, getReadRelays, DEFAULT_RELAYS, KINDS, uploadImage } from '../lib/nostrSync'
-import { satsToKsh, useRate } from '../lib/rates'
+import { satsToKsh, useRate, getRate } from '../lib/rates'
 import { nip19 } from 'nostr-tools'
 
 const C = {
@@ -101,7 +101,7 @@ function EditSheet({ product, onSave, onCancel, rate }) {
   const [errMsg,    setErrMsg]    = useState('')
   const [activeTab, setActiveTab] = useState('details')
 
-  const ksh = price ? Math.round((parseInt(price)/100_000_000) * (rate || 13_000_000)) : 0
+  const ksh = price ? Math.round((parseInt(price)/100_000_000) * (rate || getRate())) : 0
 
   const handleImageAdd = async (files) => {
     const arr = Array.from(files).slice(0, 4 - images.length)

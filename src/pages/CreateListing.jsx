@@ -7,7 +7,7 @@ import {
   Plus, Minus,
 } from 'lucide-react'
 import { publishProduct, uploadImage } from '../lib/nostrSync'
-import { satsToKsh, useRate } from '../lib/rates'
+import { satsToKsh, useRate, getRate } from '../lib/rates'
 
 const C = {
   bg:     '#f7f4f0',
@@ -294,7 +294,7 @@ function DetailsStep({ name, setName, description, setDescription, categories, s
 
 // ── Step 3: Price ─────────────────────────────
 function PriceStep({ price, setPrice, quantity, setQuantity, shipping, setShipping, rate }) {
-  const ksh = price ? Math.round((parseInt(price) / 100_000_000) * (rate || 13_000_000)) : 0
+  const ksh = price ? Math.round((parseInt(price) / 100_000_000) * (rate || getRate())) : 0
 
   const addShipping    = () => setShipping(prev => [...prev, { name: '', cost: '', regions: '' }])
   const removeShipping = (i) => setShipping(prev => prev.filter((_, idx) => idx !== i))
@@ -373,7 +373,7 @@ function PriceStep({ price, setPrice, quantity, setQuantity, shipping, setShippi
 
 // ── Step 4: Publish ───────────────────────────
 function PublishStep({ images, name, description, categories, price, quantity, shipping, isDeal, status, errMsg, rate }) {
-  const ksh = price ? Math.round((parseInt(price) / 100_000_000) * (rate || 13_000_000)) : 0
+  const ksh = price ? Math.round((parseInt(price) / 100_000_000) * (rate || getRate())) : 0
   return (
     <div>
       <div style={{ marginBottom: 20 }}>

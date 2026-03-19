@@ -6,6 +6,7 @@ import {
 } from 'lucide-react'
 import { getProfile, getProductsByPubkey, saveProfile, saveProduct } from '../lib/db'
 import { getPool, getReadRelays, DEFAULT_RELAYS, KINDS } from '../lib/nostrSync'
+import { getRate } from '../lib/rates'
 import { nip19 } from 'nostr-tools'
 
 // Pagination: cap DOM images to prevent mobile GPU bitmap eviction
@@ -24,7 +25,7 @@ const C = {
 }
 
 function satsToKsh(sats) {
-  const ksh = (sats / 100_000_000) * 13_000_000
+  const ksh = (sats / 100_000_000) * getRate()
   if (ksh >= 1000) return `KSh ${(ksh / 1000).toFixed(1)}k`
   return `KSh ${Math.round(ksh)}`
 }

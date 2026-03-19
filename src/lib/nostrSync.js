@@ -3,6 +3,7 @@
 // ─────────────────────────────────────────────
 
 import { SimplePool }    from 'nostr-tools/pool'
+import { getRate } from './rates'
 import { finalizeEvent } from 'nostr-tools/pure'
 import { nip04, nip19 } from 'nostr-tools'
 import {
@@ -482,7 +483,7 @@ export async function publishOrder({ sellerPubkey, product, quantity, message = 
   const buyer   = localStorage.getItem('bitsoko_display_name') || 'A buyer'
 
   const satsToKsh = (sats) => {
-    const ksh = (sats / 100_000_000) * 13_000_000
+    const ksh = (sats / 100_000_000) * getRate()
     return ksh >= 1000 ? `KSh ${(ksh/1000).toFixed(1)}k` : `KSh ${Math.round(ksh)}`
   }
 

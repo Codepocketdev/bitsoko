@@ -9,6 +9,7 @@ import {
 import { openDB, getProducts, getProfile, getProfiles } from '../lib/db'
 import { fetchAndSeed, startSync, stopSync, getPublicKeyHex } from '../lib/nostrSync'
 import { useNostrProfile } from '../hooks/useNostrProfile'
+import { satsToKsh, useRate } from '../lib/rates'
 
 const C = {
   bg:     '#f7f4f0',
@@ -37,12 +38,6 @@ const CATEGORIES = [
 
 const PAGE_SIZE   = 20
 const DEBOUNCE_MS = 300
-
-function satsToKsh(sats) {
-  const ksh = (sats / 100_000_000) * 13_000_000
-  if (ksh >= 1000) return `KSh ${(ksh / 1000).toFixed(1)}k`
-  return `KSh ${Math.round(ksh)}`
-}
 
 function timeAgo(ts) {
   const s = Math.floor(Date.now() / 1000) - ts
@@ -74,7 +69,7 @@ function Avatar({ profile, pubkey, size = 36 }) {
   )
 }
 
-function ProductCard({ product, profile, onClick }) {
+function ProductCard({ product, profile, onClick, rate }) {
   const image      = product.images?.[0]
   const name       = product.name  || 'Untitled'
   const price      = product.price || 0
@@ -118,7 +113,7 @@ function ProductCard({ product, profile, onClick }) {
           {name}
         </div>
         <div style={{ fontFamily: "'Inter',sans-serif", fontSize: 11, color: C.muted, marginBottom: 6 }}>
-          {satsToKsh(price)}
+          {satsToKsh(price, rate)}
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
           <Avatar profile={profile} pubkey={product.pubkey} size={16}/>
@@ -132,6 +127,7 @@ function ProductCard({ product, profile, onClick }) {
 }
 
 export default function Home() {
+  const rate = useRate()
   const navigate = useNavigate()
 
   const [products,     setProducts]     = useState([])
@@ -510,6 +506,7 @@ export default function Home() {
                   product={product}
                   profile={profiles[product.pubkey]}
                   onClick={() => navigate(`/product/${product.id}`)}
+                  rate={rate}
                 />
               ))}
             </div>
