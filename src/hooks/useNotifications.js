@@ -125,11 +125,33 @@ export function useNotifications() {
 
               // Try to decrypt — if it fails it's not for us
               try {
-                await nip04.decrypt(skHex, event.pubkey, event.content)
-                // Count by unique sender — not by message count
-                // If this sender is already counted, don't increment
+                const decryptedText = await nip04.decrypt(skHex, event.pubkey, event.content)
+                // Successfully decrypted — update Messages cache so preview is instant
+                const cacheKey  = `bitsoko_msgs_${myPubkeyHex}`
                 const senderKey = `bitsoko_unread_sender_${event.pubkey}`
                 const lastSeen  = getLastSeenTs()
+
+                try {
+                  const cached = JSON.parse(localStorage.getItem(cacheKey) || '{}')
+                  if (!cached[event.pubkey]) {
+                    cached[event.pubkey] = { messages: [], lastTs: 0, profile: null }
+                  }
+                  const conv    = cached[event.pubkey]
+                  const already = conv.messages.some(m => m.id === event.id)
+                  if (!already) {
+                    conv.messages = [...conv.messages, {
+                      id:   event.id,
+                      text: decryptedText,
+                      ts:   event.created_at,
+                      isMe: false,
+                    }].sort((a, b) => a.ts - b.ts)
+                    conv.lastTs = Math.max(conv.lastTs, event.created_at)
+                    cached[event.pubkey] = conv
+                    localStorage.setItem(cacheKey, JSON.stringify(cached))
+                  }
+                } catch {}
+
+                // Count by unique sender
                 if (!localStorage.getItem(senderKey) || parseInt(localStorage.getItem(senderKey) || '0') < lastSeen) {
                   localStorage.setItem(senderKey, String(event.created_at))
                   setUnreadCount(prev => {

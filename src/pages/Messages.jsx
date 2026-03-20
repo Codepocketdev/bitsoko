@@ -318,6 +318,9 @@ export default function Messages() {
       convRef.current = { ...convRef.current, [partnerPk]: { ...conv } }
       setConversations({ ...convRef.current })
 
+      // Save cache immediately — so preview shows latest message on next open
+      try { localStorage.setItem(CACHE_KEY, JSON.stringify(convRef.current)) } catch {}
+
       // Play sound + show scroll button if new message from someone else in open thread
       if (!isMe && partnerPk === selected) {
         playPing()
@@ -341,7 +344,8 @@ export default function Messages() {
       if (doneCount >= totalRelays) {
         setLoading(false)
         try { localStorage.setItem(CACHE_KEY, JSON.stringify(convRef.current)) } catch {}
-        markAllMessagesRead()
+        // Don't mark read here — user hasn't actually read them yet
+        // markAllMessagesRead() is called on mount and when thread opens
       }
     }
 
