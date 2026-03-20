@@ -10,6 +10,7 @@ import { openDB, getProducts, getProfile, getProfiles } from '../lib/db'
 import { fetchAndSeed, startSync, stopSync, getPublicKeyHex } from '../lib/nostrSync'
 import { useNostrProfile } from '../hooks/useNostrProfile'
 import { satsToKsh, useRate } from '../lib/rates'
+import { useNotifications } from '../hooks/useNotifications'
 
 const C = {
   bg:     '#f7f4f0',
@@ -129,6 +130,7 @@ function ProductCard({ product, profile, onClick, rate }) {
 export default function Home() {
   const rate = useRate()
   const navigate = useNavigate()
+  const { unreadCount } = useNotifications()
 
   const [products,     setProducts]     = useState([])
   const [profiles,     setProfiles]     = useState({})
@@ -358,6 +360,18 @@ export default function Home() {
               position: 'relative',
             }}>
               <Bell size={17} color={C.black}/>
+              {unreadCount > 0 && (
+                <div style={{
+                  position: 'absolute', top: 2, right: 2,
+                  minWidth: 16, height: 16, borderRadius: 99,
+                  background: C.orange, border: `2px solid ${C.white}`,
+                  display: 'flex', alignItems: 'center', justifyContent: 'center',
+                  fontSize: 9, fontWeight: 700, color: C.white,
+                  padding: '0 3px',
+                }}>
+                  {unreadCount > 99 ? '99+' : unreadCount}
+                </div>
+              )}
             </button>
           </div>
         </div>

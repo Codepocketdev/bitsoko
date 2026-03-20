@@ -184,6 +184,9 @@ export async function publishEscrowOrder({
   orders.unshift({ ...orderData, nostrEventId: event.id })
   saveLocalOrders(orders)
 
+  // Notify bell badge if seller is on same device
+  window.dispatchEvent(new CustomEvent('bitsoko_new_order'))
+
   return { orderId, nostrEventId: event.id }
 }
 

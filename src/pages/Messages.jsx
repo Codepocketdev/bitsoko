@@ -2,13 +2,14 @@ import { useState, useEffect, useRef } from 'react'
 import { useNavigate, useLocation } from 'react-router-dom'
 import {
   ArrowLeft, Send, Loader, Lock,
-  MessageCircle, ChevronLeft, Package,
+  MessageCircle, ChevronLeft, ChevronDown,
 } from 'lucide-react'
 import { getPool, getReadRelays, getWriteRelays, DEFAULT_RELAYS, getSecretKey } from '../lib/nostrSync'
 import { getProfile, saveProfile } from '../lib/db'
 import { nip04 } from 'nostr-tools'
 import { finalizeEvent } from 'nostr-tools/pure'
 import { nip19 } from 'nostr-tools'
+import { markAllMessagesRead, saveUnreadCount, getLastSeenTs } from '../hooks/useNotifications'
 
 const C = {
   bg:     '#f7f4f0',
@@ -101,6 +102,83 @@ function Bubble({ text, ts, isMe }) {
   )
 }
 
+// ── NIP-42 raw WebSocket DM fetcher ────────────
+// Required because pool.querySync doesn't handle AUTH — relays reject without it
+function fetchDMsFromRelay(relayUrl, skBytes, f1, f2, onEvent, onDone) {
+  const subId = 'dm-' + Math.random().toString(36).slice(2, 8)
+  let ws, done = false, authed = false
+
+  const finish = () => {
+    if (done) return; done = true
+    try { ws?.close() } catch {}
+    onDone()
+  }
+  const sendReq  = () => ws.send(JSON.stringify(['REQ', subId, f1, f2]))
+  const sendAuth = (ch) => {
+    const ev = finalizeEvent({
+      kind: 22242, created_at: Math.floor(Date.now() / 1000),
+      tags: [['relay', relayUrl], ['challenge', ch]], content: '',
+    }, skBytes)
+    ws.send(JSON.stringify(['AUTH', ev]))
+  }
+
+  try {
+    ws = new WebSocket(relayUrl)
+    ws.onopen    = () => sendReq()
+    ws.onmessage = ({ data }) => {
+      if (done) return
+      let msg; try { msg = JSON.parse(data) } catch { return }
+      const [type, ...rest] = msg
+      if (type === 'AUTH') sendAuth(rest[0])
+      if (type === 'OK' && !authed) { authed = true; sendReq() }
+      if (type === 'EVENT' && rest[1]?.kind === 4) onEvent(rest[1])
+      if (type === 'EOSE') finish()
+      if (type === 'CLOSED' && !(rest[1] || '').toLowerCase().includes('auth-required')) finish()
+    }
+    ws.onerror = () => finish()
+    ws.onclose = () => finish()
+    setTimeout(() => finish(), 5000)
+  } catch { finish() }
+
+  return () => { done = true; try { ws?.close() } catch {} }
+}
+
+// ── Live WebSocket subscription — stays open ────
+function subscribeLiveDMs(relayUrl, skBytes, f1, f2, onEvent) {
+  let ws, closed = false, authed = false
+  const subId = 'dm-live-' + Math.random().toString(36).slice(2, 8)
+
+  const sendReq  = () => ws.send(JSON.stringify(['REQ', subId, f1, f2]))
+  const sendAuth = (ch) => {
+    const ev = finalizeEvent({
+      kind: 22242, created_at: Math.floor(Date.now() / 1000),
+      tags: [['relay', relayUrl], ['challenge', ch]], content: '',
+    }, skBytes)
+    ws.send(JSON.stringify(['AUTH', ev]))
+  }
+
+  const connect = () => {
+    if (closed) return
+    try {
+      ws = new WebSocket(relayUrl)
+      ws.onopen    = () => { if (!closed) sendReq() }
+      ws.onmessage = ({ data }) => {
+        if (closed) return
+        let msg; try { msg = JSON.parse(data) } catch { return }
+        const [type, ...rest] = msg
+        if (type === 'AUTH') sendAuth(rest[0])
+        if (type === 'OK' && !authed) { authed = true; sendReq() }
+        if (type === 'EVENT' && rest[1]?.kind === 4) onEvent(rest[1])
+      }
+      ws.onerror = () => {}
+      ws.onclose = () => { if (!closed) setTimeout(connect, 3000) }
+    } catch {}
+  }
+
+  connect()
+  return () => { closed = true; try { ws?.close() } catch {} }
+}
+
 export default function Messages() {
   const navigate   = useNavigate()
   const location   = useLocation()
@@ -114,16 +192,67 @@ export default function Messages() {
   const [selected,     setSelected]     = useState(null)
   const [input,        setInput]        = useState('')
   const [sending,      setSending]      = useState(false)
+  const [atBottom,     setAtBottom]     = useState(true)
+  const [newMsgCount,  setNewMsgCount]  = useState(0)
   const bottomRef      = useRef(null)
+  const scrollRef      = useRef(null)
   const seenRef        = useRef(new Set())
   const convRef        = useRef({})
   const liveClosersRef = useRef([])
+
+  // Play subtle ping sound when new message arrives
+  const playPing = () => {
+    try {
+      const ctx  = new (window.AudioContext || window.webkitAudioContext)()
+      const osc  = ctx.createOscillator()
+      const gain = ctx.createGain()
+      osc.connect(gain)
+      gain.connect(ctx.destination)
+      osc.frequency.value = 880
+      osc.type = 'sine'
+      gain.gain.setValueAtTime(0.15, ctx.currentTime)
+      gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.3)
+      osc.start(ctx.currentTime)
+      osc.stop(ctx.currentTime + 0.3)
+    } catch {}
+  }
+
+  const scrollToBottom = () => {
+    bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
+    setNewMsgCount(0)
+    setAtBottom(true)
+  }
+
+  const fetchProfile = async (pubkey, relays) => {
+    try {
+      const cached = await getProfile(pubkey)
+      if (cached) {
+        convRef.current[pubkey] = { ...convRef.current[pubkey], profile: cached }
+        setConversations({ ...convRef.current })
+        return
+      }
+      const pool   = getPool()
+      const events = await pool.querySync(relays, { kinds: [0], authors: [pubkey], limit: 1 })
+      if (events.length) {
+        const p = JSON.parse(events[0].content)
+        await saveProfile(pubkey, p)
+        convRef.current[pubkey] = { ...convRef.current[pubkey], profile: p }
+        setConversations({ ...convRef.current })
+      }
+    } catch {}
+  }
+
+  // Mark all read when Messages page opens
+  useEffect(() => {
+    markAllMessagesRead()
+  }, [])
 
   // Auto-open conversation when navigated from Orders / ProductDetail
   useEffect(() => {
     const pubkey = location.state?.pubkey
     if (!pubkey) return
     setSelected(pubkey)
+    markAllMessagesRead()
     if (!convRef.current[pubkey]) {
       convRef.current[pubkey] = { messages: [], lastTs: 0, profile: null }
       setConversations(prev => ({ ...prev, [pubkey]: convRef.current[pubkey] }))
@@ -134,13 +263,15 @@ export default function Messages() {
   // ── Fetch and decrypt all DMs ──────────────
   const CACHE_KEY = `bitsoko_msgs_${myPubkey}`
 
-  // Load cached conversations instantly on mount
+  // Load cache instantly on mount and sync to convRef
   useEffect(() => {
     if (!myPubkey) return
     try {
       const cached = localStorage.getItem(CACHE_KEY)
       if (cached) {
-        setConversations(JSON.parse(cached))
+        const parsed = JSON.parse(cached)
+        convRef.current = parsed
+        setConversations(parsed)
         setLoading(false)
       }
     } catch {}
@@ -149,88 +280,112 @@ export default function Messages() {
   useEffect(() => {
     if (!myPubkey) { setLoading(false); return }
 
-    const load = async () => {
-      try {
-        const relays = [...new Set([...getReadRelays(), ...DEFAULT_RELAYS])]
-        const pool   = getPool()
-        const sk     = getSecretKey()
-        const skHex  = skToHex(sk)
+    let sk, skHex
+    try {
+      sk    = getSecretKey()
+      skHex = skToHex(sk)
+    } catch { setError('Could not load keys'); setLoading(false); return }
 
-        // Fetch sent and received in parallel
-        const [sent, received] = await Promise.all([
-          pool.querySync(relays, { kinds: [4], authors: [myPubkey], limit: 200 }),
-          pool.querySync(relays, { kinds: [4], '#p': [myPubkey], limit: 200 }),
-        ])
+    const relays     = [...new Set([...getReadRelays(), ...DEFAULT_RELAYS])]
+    let doneCount    = 0
+    const totalRelays = relays.length
 
-        const all = [...sent, ...received]
-        // Deduplicate by event id
-        const unique = Array.from(new Map(all.map(e => [e.id, e])).values())
-        unique.sort((a, b) => a.created_at - b.created_at)
+    const onEvent = async (event) => {
+      if (seenRef.current.has(event.id)) return
+      seenRef.current.add(event.id)
 
-        // Build conversations map
-        const convMap = {}
+      const isMe      = event.pubkey === myPubkey
+      const partnerPk = isMe
+        ? (event.tags.find(t => t[0] === 'p')?.[1] || '')
+        : event.pubkey
+      if (!partnerPk) return
 
-        for (const event of unique) {
-          const isMe      = event.pubkey === myPubkey
-          const partnerPk = isMe
-            ? (event.tags.find(t => t[0] === 'p')?.[1] || '')
-            : event.pubkey
+      let text = '[encrypted message]'
+      try { text = await nip04.decrypt(skHex, partnerPk, event.content) } catch {}
 
-          if (!partnerPk) continue
+      const msg = { id: event.id, text, ts: event.created_at, isMe }
 
-          // Decrypt
-          let text = '[encrypted message]'
-          try {
-            text = await nip04.decrypt(skHex, partnerPk, event.content)
-          } catch {}
-
-          if (!convMap[partnerPk]) convMap[partnerPk] = { messages: [], lastTs: 0, profile: null }
-
-          convMap[partnerPk].messages.push({ id: event.id, text, ts: event.created_at, isMe })
-          if (event.created_at > convMap[partnerPk].lastTs) {
-            convMap[partnerPk].lastTs = event.created_at
-          }
-        }
-
-        // Load profiles for each partner
-        for (const partnerPk of Object.keys(convMap)) {
-          const cached = await getProfile(partnerPk)
-          if (cached) {
-            convMap[partnerPk].profile = cached
-          } else {
-            // Fetch profile in background
-            pool.querySync(relays, { kinds: [0], authors: [partnerPk], limit: 1 })
-              .then(events => {
-                if (events.length) {
-                  const p = JSON.parse(events[0].content)
-                  saveProfile(partnerPk, p)
-                  setConversations(prev => ({
-                    ...prev,
-                    [partnerPk]: { ...prev[partnerPk], profile: p }
-                  }))
-                }
-              }).catch(() => {})
-          }
-        }
-
-        setConversations(convMap)
-        try { localStorage.setItem(CACHE_KEY, JSON.stringify(convMap)) } catch {}
-      } catch(e) {
-        setError('Could not load messages. Check your connection.')
-        console.error('[bitsoko] messages error:', e)
+      if (!convRef.current[partnerPk]) {
+        convRef.current[partnerPk] = { messages: [], lastTs: 0, profile: null }
+        fetchProfile(partnerPk, relays)
       }
-      setLoading(false)
+
+      const conv = convRef.current[partnerPk]
+      if (conv.messages.some(m => m.id === event.id)) return
+
+      conv.messages = [...conv.messages, msg].sort((a, b) => a.ts - b.ts)
+      conv.lastTs   = Math.max(conv.lastTs, event.created_at)
+      convRef.current = { ...convRef.current, [partnerPk]: { ...conv } }
+      setConversations({ ...convRef.current })
+
+      // Play sound + show scroll button if new message from someone else in open thread
+      if (!isMe && partnerPk === selected) {
+        playPing()
+        setAtBottom(prev => {
+          if (!prev) setNewMsgCount(c => c + 1)
+          return prev
+        })
+      }
+
+      // Update bell count
+      const lastSeenTs = getLastSeenTs()
+      const unread = Object.values(convRef.current).filter(c => {
+        const last = c.messages?.[c.messages.length - 1]
+        return last && !last.isMe && last.ts > lastSeenTs
+      }).length
+      saveUnreadCount(unread)
     }
 
-    load()
+    const onDone = () => {
+      doneCount++
+      if (doneCount >= totalRelays) {
+        setLoading(false)
+        try { localStorage.setItem(CACHE_KEY, JSON.stringify(convRef.current)) } catch {}
+        markAllMessagesRead()
+      }
+    }
+
+    // Raw WebSocket fetch with NIP-42 auth — required by damus, primal etc
+    const fSent = { kinds: [4], authors: [myPubkey], limit: 200 }
+    const fRecv = { kinds: [4], '#p': [myPubkey], limit: 200 }
+    const fetchClosers = relays.map(r =>
+      fetchDMsFromRelay(r, sk, fSent, fRecv, onEvent, onDone)
+    )
+
+    // Live subscription — since lastSeenTs so unread messages arrive immediately
+    // Using lastSeenTs (not now) means messages sent before page opened come through instantly
+    const lastSeen = getLastSeenTs() || Math.floor(Date.now() / 1000) - 3600
+    const lSent = { kinds: [4], authors: [myPubkey], since: lastSeen }
+    const lRecv = { kinds: [4], '#p': [myPubkey], since: lastSeen }
+    const liveClosers = relays.map(r =>
+      subscribeLiveDMs(r, sk, lSent, lRecv, onEvent)
+    )
+    liveClosersRef.current = liveClosers
+
+    return () => {
+      fetchClosers.forEach(c => c?.())
+      liveClosers.forEach(c => c?.())
+    }
   }, [myPubkey])
 
-  // Scroll to bottom when conversation opens or messages update
+  // Scroll to bottom when conversation opens or new messages arrive while at bottom
   useEffect(() => {
-    if (selected && bottomRef.current) {
-      bottomRef.current.scrollIntoView({ behavior: 'smooth' })
+    if (selected) {
+      setTimeout(() => {
+        bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
+        setNewMsgCount(0)
+      }, 50)
     }
-  }, [selected, conversations])
+  }, [selected])
+
+  // Auto-scroll only when already at bottom
+  useEffect(() => {
+    if (selected && atBottom) {
+      setTimeout(() => {
+        bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
+      }, 50)
+    }
+  }, [conversations])
 
   // ── Send a reply ───────────────────────────
   const handleSend = async () => {
@@ -240,29 +395,30 @@ export default function Messages() {
     setInput('')
 
     try {
-      const sk     = getSecretKey()
-      const skHex  = skToHex(sk)
+      const sk        = getSecretKey()
+      const skHex     = skToHex(sk)
       const encrypted = await nip04.encrypt(skHex, selected, text)
 
       const event = finalizeEvent({
-        kind: 4,
+        kind:       4,
         created_at: Math.floor(Date.now() / 1000),
-        tags: [['p', selected]],
-        content: encrypted,
+        tags:       [['p', selected]],
+        content:    encrypted,
       }, sk)
 
+      // Optimistic update FIRST — message appears instantly before relay responds
+      const newMsg = { id: event.id, text, ts: event.created_at, isMe: true }
+      convRef.current[selected] = {
+        ...convRef.current[selected],
+        messages: [...(convRef.current[selected]?.messages || []), newMsg],
+        lastTs:   event.created_at,
+      }
+      setConversations({ ...convRef.current })
+
+      // Then publish to relay
       const relays = [...new Set([...getWriteRelays(), ...DEFAULT_RELAYS])]
       await Promise.any(getPool().publish(relays, event))
 
-      // Optimistic update
-      setConversations(prev => ({
-        ...prev,
-        [selected]: {
-          ...prev[selected],
-          messages: [...(prev[selected]?.messages || []), { id: event.id, text, ts: event.created_at, isMe: true }],
-          lastTs: event.created_at,
-        }
-      }))
     } catch(e) {
       setInput(text) // restore on failure
       console.error('[bitsoko] send DM error:', e)
@@ -288,14 +444,14 @@ export default function Messages() {
   // ── Conversation thread view ───────────────
   if (selected) {
     return (
-      <div style={{ background: C.bg, minHeight: '100vh', fontFamily: "'Inter',sans-serif", display: 'flex', flexDirection: 'column' }}>
+      <div style={{ background: C.bg, minHeight: '100vh', fontFamily: "'Inter',sans-serif" }}>
 
-        {/* Thread header */}
-        <div style={{ background: C.white, borderBottom: `1px solid ${C.border}`, padding: '14px 16px', display: 'flex', alignItems: 'center', gap: 12, position: 'sticky', top: 0, zIndex: 50, flexShrink: 0 }}>
+        {/* Header — fixed at top, always visible */}
+        <div style={{ position: 'fixed', top: 0, left: 0, right: 0, zIndex: 50, background: C.white, borderBottom: `1px solid ${C.border}`, padding: '14px 16px', display: 'flex', alignItems: 'center', gap: 12 }}>
           <button onClick={() => setSelected(null)} style={{ background: 'none', border: 'none', cursor: 'pointer', display: 'flex', alignItems: 'center', color: C.black, padding: 4 }}>
             <ChevronLeft size={22}/>
           </button>
-          <Avatar profile={selectedConv.profile} pubkey={selected} size={36}/>
+          <Avatar profile={selectedConv?.profile} pubkey={selected} size={36}/>
           <div style={{ flex: 1, minWidth: 0 }}>
             <div style={{ fontSize: 14, fontWeight: 700, color: C.black, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{partnerName}</div>
             <div style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 10, color: C.muted }}>
@@ -304,16 +460,48 @@ export default function Messages() {
           </div>
         </div>
 
-        {/* Messages */}
-        <div style={{ flex: 1, overflowY: 'auto', padding: '16px 16px 80px' }}>
-          {selectedConv.messages.map(msg => (
+        {/* Messages — scrolls between header and input */}
+        <div
+          ref={scrollRef}
+          onScroll={e => {
+            const el = e.currentTarget
+            const isAtBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 60
+            setAtBottom(isAtBottom)
+            if (isAtBottom) setNewMsgCount(0)
+          }}
+          style={{ position: 'fixed', top: 65, bottom: 130, left: 0, right: 0, overflowY: 'auto', padding: '16px' }}>
+          {(selectedConv?.messages || []).map(msg => (
             <Bubble key={msg.id} text={msg.text} ts={msg.ts} isMe={msg.isMe}/>
           ))}
           <div ref={bottomRef}/>
         </div>
 
-        {/* Input bar */}
-        <div style={{ position: 'fixed', bottom: 64, left: 0, right: 0, background: C.white, borderTop: `1px solid ${C.border}`, padding: '12px 16px', display: 'flex', gap: 10, alignItems: 'flex-end' }}>
+        {/* Scroll to bottom button — shows when not at bottom */}
+        {!atBottom && (
+          <button onClick={scrollToBottom} style={{
+            position: 'fixed', bottom: 140, right: 20, zIndex: 60,
+            width: 40, height: 40, borderRadius: '50%',
+            background: C.black, border: 'none', cursor: 'pointer',
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+            boxShadow: '0 2px 12px rgba(26,20,16,0.3)',
+          }}>
+            <ChevronDown size={20} color={C.white}/>
+            {newMsgCount > 0 && (
+              <div style={{
+                position: 'absolute', top: -4, right: -4,
+                minWidth: 18, height: 18, borderRadius: 99,
+                background: C.orange, border: `2px solid ${C.white}`,
+                display: 'flex', alignItems: 'center', justifyContent: 'center',
+                fontSize: 9, fontWeight: 700, color: C.white, padding: '0 3px',
+              }}>
+                {newMsgCount}
+              </div>
+            )}
+          </button>
+        )}
+
+        {/* Input bar — fixed at bottom above nav */}
+        <div style={{ position: 'fixed', bottom: 64, left: 0, right: 0, background: C.white, borderTop: `1px solid ${C.border}`, padding: '12px 16px', display: 'flex', gap: 10, alignItems: 'flex-end', zIndex: 50 }}>
           <textarea
             value={input}
             onChange={e => setInput(e.target.value)}
