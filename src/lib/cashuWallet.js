@@ -4,12 +4,36 @@
 // Requires: @cashu/cashu-ts@2.7.4 (exact)
 // ─────────────────────────────────────────────
 
-import { CashuMint, CashuWallet, getEncodedToken, getDecodedToken } from '@cashu/cashu-ts'
+import { CashuMint, CashuWallet, getEncodedToken, getDecodedToken, CheckStateEnum } from '@cashu/cashu-ts'
+import { generateMnemonic, mnemonicToSeedSync, validateMnemonic } from '@scure/bip39'
+import { wordlist } from '@scure/bip39/wordlists/english.js'
 
 export const DEFAULT_MINT_URL  = 'https://mint.minibits.cash/Bitcoin'
 export const BITSOKO_FEE_LUD16 = 'hodlcurator@blink.sv'
 export const BITSOKO_FEE_PCT   = 0.02
-export const BITSOKO_MIN_FEE   = 1  // actual min sat
+export const BITSOKO_MIN_FEE   = 1
+
+const SEED_KEY = 'bitsoko_wallet_seed'
+
+// ── Seed management ────────────────────────────
+// Generates a 12-word mnemonic on first use — stored in localStorage
+// Proofs are now deterministic: restoreable from seed on any device
+export function getOrCreateSeed() {
+  let seed = localStorage.getItem(SEED_KEY)
+  if (!seed) {
+    seed = generateMnemonic(wordlist, 128) // 12 words
+    localStorage.setItem(SEED_KEY, seed)
+  }
+  return seed
+}
+
+export function getSeed() {
+  return localStorage.getItem(SEED_KEY) || null
+}
+
+export function validateSeedPhrase(phrase) {
+  return validateMnemonic(phrase.trim().toLowerCase().replace(/\s+/g, ' '), wordlist)
+}
 
 // ── Storage ────────────────────────────────────
 export function getWalletData() {
@@ -48,33 +72,123 @@ export function getBalance() {
   } catch { return 0 }
 }
 
-// ── Create wallet — SatoshiPay useWallet.js pattern ──
-// new CashuWallet(mint, { unit }) then await wallet.getKeys()
+// ── Create wallet — with bip39seed for deterministic proofs ──
+// Proofs created with bip39seed are restoreable from the seed phrase
 async function createWallet(mintUrl) {
-  const url    = mintUrl || getWalletData().mints[0] || DEFAULT_MINT_URL
-  const mint   = new CashuMint(url)
-  const wallet = new CashuWallet(mint, { unit: 'sat' })
+  const url      = mintUrl || getWalletData().mints[0] || DEFAULT_MINT_URL
+  const mint     = new CashuMint(url)
+  const mnemonic = getOrCreateSeed()
+  const bip39seed = mnemonicToSeedSync(mnemonic)
+  const wallet   = new CashuWallet(mint, { unit: 'sat', bip39seed })
   await wallet.getKeys()
   return { wallet, mint, url }
 }
 
-// ── MINT ───────────────────────────────────────
-// Estimate how much to mint to cover product price + Lightning routing fee reserve
-// We pre-fetch a dummy melt quote to know the actual fee_reserve for this mint
-export async function estimateMintAmount(productPriceSats, sellerLud16, mintUrl) {
-  try {
-    const { wallet } = await createWallet(mintUrl)
-    const invoice    = await fetchLnurlInvoice(sellerLud16, productPriceSats)
-    const quote      = await wallet.createMeltQuote(invoice)
-    // Total proofs needed = product amount + routing reserve
-    return quote.amount + quote.fee_reserve
-  } catch {
-    // Fallback: add 2 sat buffer if estimation fails
-    return productPriceSats + 2
-  }
+// ── Export wallet token ────────────────────────
+// Encodes ALL current proofs as a cashuA token — paste anywhere to restore
+export function exportWalletToken() {
+  const { tokens, mints } = getWalletData()
+  if (!tokens.length) throw new Error('No proofs to export')
+  const mintUrl = mints[0] || DEFAULT_MINT_URL
+  return getEncodedToken({ mint: mintUrl, proofs: tokens })
 }
 
-// SatoshiPay: wallet.mint.createMintQuote({ amount, unit })
+// ── Restore wallet from seed ───────────────────
+// Ports SatoshiPay handleRestoreWallet exactly
+// progressCallback(mintUrl, status, data) — status: 'scanning' | 'done' | 'error'
+export async function restoreWallet(mnemonic, mintUrls, progressCallback) {
+  const cleanMnemonic = mnemonic.trim().toLowerCase().replace(/\s+/g, ' ')
+  if (!validateMnemonic(cleanMnemonic, wordlist)) throw new Error('Invalid recovery phrase')
+
+  const bip39seed  = mnemonicToSeedSync(cleanMnemonic)
+  const BATCH_SIZE = 200
+  const MAX_EMPTY  = 2
+
+  let totalSats   = 0
+  let totalProofs = 0
+  const allTokens = []
+
+  for (const mintUrl of mintUrls) {
+    try {
+      progressCallback(mintUrl, 'scanning', { message: 'Connecting to mint…' })
+
+      const mint       = new CashuMint(mintUrl)
+      const scanWallet = new CashuWallet(mint, { bip39seed, unit: 'sat' })
+
+      let info
+      try { info = await mint.getInfo() } catch { info = {} }
+
+      const supportsRestore = info?.nuts?.['9']?.supported || info?.nuts?.['7']?.supported
+      if (!supportsRestore) {
+        progressCallback(mintUrl, 'done', { message: 'Mint does not support restore', totalSats: 0, proofCount: 0 })
+        continue
+      }
+
+      const keysetsData = await mint.getKeySets()
+      const keysets     = keysetsData.keysets || []
+      let mintSats   = 0
+      let mintProofs = 0
+
+      for (const keyset of keysets) {
+        try {
+          progressCallback(mintUrl, 'scanning', { message: `Scanning keyset ${keyset.id.slice(0, 12)}…` })
+
+          const kWallet = new CashuWallet(mint, { bip39seed, unit: keyset.unit || 'sat' })
+          let start = 0, emptyCount = 0, restoreProofs = []
+
+          while (emptyCount < MAX_EMPTY) {
+            let proofs = []
+            try {
+              const res = await kWallet.restore(start, BATCH_SIZE, { keysetId: keyset.id })
+              proofs = res?.proofs || []
+            } catch { proofs = [] }
+
+            if (!proofs.length) { emptyCount++ }
+            else { restoreProofs = restoreProofs.concat(proofs); emptyCount = 0 }
+            start += BATCH_SIZE
+          }
+
+          if (restoreProofs.length > 0) {
+            progressCallback(mintUrl, 'scanning', { message: `Checking ${restoreProofs.length} proofs…` })
+
+            let unspent = []
+            for (let i = 0; i < restoreProofs.length; i += BATCH_SIZE) {
+              const batch  = restoreProofs.slice(i, i + BATCH_SIZE)
+              const states = await kWallet.checkProofsStates(batch)
+              const unspentProofs = batch.filter((_, j) =>
+                states[j]?.state === CheckStateEnum.UNSPENT
+              )
+              unspent = unspent.concat(unspentProofs)
+            }
+
+            if (unspent.length > 0) {
+              const amount = unspent.reduce((s, p) => s + p.amount, 0)
+              mintSats   += amount
+              mintProofs += unspent.length
+              const token = getEncodedToken({ mint: mintUrl, proofs: unspent })
+              allTokens.push({ mint: mintUrl, token, amount, proofCount: unspent.length })
+            }
+          }
+        } catch(e) { console.warn('[bitsoko] keyset scan error:', e.message) }
+      }
+
+      progressCallback(mintUrl, 'done', {
+        message:    mintSats > 0 ? `Found ${mintSats} sats` : 'No tokens found',
+        totalSats:  mintSats,
+        proofCount: mintProofs,
+      })
+
+      totalSats   += mintSats
+      totalProofs += mintProofs
+    } catch(e) {
+      progressCallback(mintUrl, 'error', { message: e.message, totalSats: 0, proofCount: 0 })
+    }
+  }
+
+  return { tokens: allTokens, totalSats, totalProofs }
+}
+
+// ── MINT ───────────────────────────────────────
 export async function createMintInvoice(amountSats, mintUrl) {
   const { wallet, url } = await createWallet(mintUrl)
   const mintQuote = await wallet.mint.createMintQuote({ amount: amountSats, unit: 'sat' })
@@ -114,7 +228,6 @@ export function pollMintQuote(wallet, amountSats, hash, mintUrl, onPaid, onError
 }
 
 // ── PAY ────────────────────────────────────────
-// SatoshiPay SendViaLightning: createMeltQuote → send → meltProofs → check PAID
 export async function payLightningInvoice(invoiceString, mintUrl) {
   const { wallet } = await createWallet(mintUrl)
   const { tokens } = getWalletData()
@@ -154,7 +267,6 @@ export async function getMeltFeeEstimate(invoiceString, mintUrl) {
 }
 
 // ── SEND ───────────────────────────────────────
-// SatoshiPay SendViaEcash: wallet.send → { send, keep } → getEncodedToken
 export async function sendCashuToken(amountSats, mintUrl) {
   const { wallet, url } = await createWallet(mintUrl)
   const { tokens }      = getWalletData()
@@ -175,11 +287,9 @@ export async function sendCashuToken(amountSats, mintUrl) {
 }
 
 // ── RECEIVE ────────────────────────────────────
-// SatoshiPay ReceivePage: getDecodedToken → wallet.receive(token, { counter, proofsWeHave })
 export async function receiveCashuToken(tokenString) {
   const { tokens } = getWalletData()
 
-  // Strip cashu: / cashu:// / web+cashu:// prefixes
   let tokenToDecode = tokenString.trim()
   if (tokenToDecode.toLowerCase().startsWith('cashu')) {
     if (tokenToDecode.startsWith('cashu:')) {
@@ -194,9 +304,9 @@ export async function receiveCashuToken(tokenString) {
   let tokenMintUrl
 
   if (decoded.token && Array.isArray(decoded.token)) {
-    tokenMintUrl = decoded.token[0]?.mint      // V3
+    tokenMintUrl = decoded.token[0]?.mint
   } else if (decoded.mint) {
-    tokenMintUrl = decoded.mint                // V4
+    tokenMintUrl = decoded.mint
   } else if (Array.isArray(decoded)) {
     tokenMintUrl = decoded[0]?.mint
   }
@@ -207,10 +317,7 @@ export async function receiveCashuToken(tokenString) {
   const wallet = new CashuWallet(mint, { unit: 'sat' })
   await wallet.getKeys()
 
-  // Don't pass counter/proofsWeHave — requires bip39seed which we don't have
-  // Simple receive works fine without deterministic blinding
   const receivedProofs = await wallet.receive(tokenToDecode)
-
   if (!receivedProofs?.length) throw new Error('Token already claimed or invalid')
 
   const amount = receivedProofs.reduce((s, p) => s + p.amount, 0)
@@ -240,13 +347,6 @@ export async function fetchLnurlInvoice(lud16, amountSats) {
 }
 
 // ── PURCHASE WITH FEE SPLIT ────────────────────
-// How much to mint when paying via external wallet.
-// Adds a flat 2-sat buffer to cover Lightning routing fee reserves.
-// Any leftover change stays in wallet.
-export function purchaseMintAmount(totalSats) {
-  return totalSats + 2
-}
-
 export async function purchaseWithFeeSplit({ sellerLud16, totalSats, mintUrl, productName = 'Product' }) {
   if (!sellerLud16) throw new Error('Seller has no Lightning address')
 
@@ -256,7 +356,7 @@ export async function purchaseWithFeeSplit({ sellerLud16, totalSats, mintUrl, pr
 
   if (balance < totalSats) throw new Error(`Need ${totalSats} sats, wallet has ${balance}`)
 
-  // Step 1: Take our 2% fee FIRST — paid from totalSats
+  // Step 1: Pay our 2% fee FIRST
   const feeSats = Math.floor(totalSats * BITSOKO_FEE_PCT)
 
   if (feeSats >= 1) {
@@ -264,10 +364,8 @@ export async function purchaseWithFeeSplit({ sellerLud16, totalSats, mintUrl, pr
       const feeInvoice   = await fetchLnurlInvoice(BITSOKO_FEE_LUD16, feeSats)
       const feeMeltQuote = await wallet.createMeltQuote(feeInvoice)
       const feeNeeded    = feeMeltQuote.amount + feeMeltQuote.fee_reserve
-
       const { send: feeProofs, keep: feeKeep } = await wallet.send(feeNeeded, tokens)
       saveTokens(feeKeep || [])
-
       const feeMelt = await wallet.meltProofs(feeMeltQuote, feeProofs)
       const { tokens: afterFee } = getWalletData()
       saveTokens([...afterFee, ...(feeMelt?.change || [])])
@@ -276,12 +374,11 @@ export async function purchaseWithFeeSplit({ sellerLud16, totalSats, mintUrl, pr
     }
   }
 
-  // Step 2: Pay seller — whatever balance remains after our fee + routing
+  // Step 2: Pay seller from remaining balance
   const { tokens: remaining } = getWalletData()
   const remainingBal = remaining.reduce((s, p) => s + p.amount, 0)
   if (remainingBal < 1) throw new Error('Insufficient balance for seller payment')
 
-  // Get melt quote to know routing cost, then pay seller net of routing
   const dummyInvoice   = await fetchLnurlInvoice(sellerLud16, remainingBal)
   const dummyQuote     = await wallet.createMeltQuote(dummyInvoice)
   const sellerAmount   = remainingBal - dummyQuote.fee_reserve
@@ -308,7 +405,6 @@ export async function purchaseWithFeeSplit({ sellerLud16, totalSats, mintUrl, pr
   addHistory({ type: 5, amount: totalSats, label: productName, date: Math.floor(Date.now() / 1000) })
   return { success: true, sellerSats: sellerAmount, feeSats }
 }
-
 
 export function clearWallet() {
   localStorage.removeItem('bitsoko_wallet_tokens')

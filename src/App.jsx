@@ -1,5 +1,5 @@
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
-import { useState, lazy, Suspense } from 'react'
+import { useState } from 'react'
 import './styles/index.css'
 
 import Landing       from './pages/Landing'
@@ -19,10 +19,8 @@ import ShopAnalytics from './pages/ShopAnalytics'
 import CreateListing from './pages/CreateListing'
 import ProductDetail from './pages/ProductDetail'
 import PageWrapper   from './components/layout/PageWrapper'
-import BTCMap       from './pages/BTCMap'
-
-// Lazy load heavy/optional pages so crashes stay isolated
-const Wallet = lazy(() => import('./pages/Wallet'))
+import BTCMap        from './pages/BTCMap'
+import Dashboard     from './pages/Dashboard'
 
 const isLoggedIn = () => !!localStorage.getItem('bitsoko_nsec')
 
@@ -60,30 +58,27 @@ export default function App() {
     <BrowserRouter>
       <Routes>
         {/* Full-screen pages — no BottomNav, no PageWrapper teardown on nav */}
-        <Route path="/create-listing"   element={<CreateListing />}/>
-        <Route path="/product/:id"      element={<ProductDetail />}/>
-        <Route path="/seller/:pubkey"   element={<SellerProfile />}/>
-        <Route path="/wallet"          element={<Suspense fallback={<div style={{minHeight:'100vh',background:'#1a1410'}}/>}><Wallet /></Suspense>}/>
-        <Route path="/map"              element={<BTCMap />}/>
+        <Route path="/create-listing"  element={<CreateListing />}/>
+        <Route path="/product/:id"     element={<ProductDetail />}/>
+        <Route path="/seller/:pubkey"  element={<SellerProfile />}/>
+        <Route path="/map"             element={<BTCMap />}/>
+        <Route path="/dashboard"       element={<Dashboard />}/>
 
-        {/* App shell — PageWrapper stays mounted across ALL these routes.
-            FIX: Profile was outside PageWrapper before, causing a full
-            component-tree teardown on every navigate from More sheet → Profile.
-            Now it's inside, navigation is just a child swap — instant. */}
+        {/* App shell — PageWrapper stays mounted across ALL these routes */}
         <Route path="*" element={
           <PageWrapper toggleTheme={toggleTheme} theme={theme}>
             <Routes>
-              <Route path="/"                element={<Home />}/>
-              <Route path="/explore"         element={<Explore />}/>
-              <Route path="/deals"           element={<Deals />}/>
-              <Route path="/cart"            element={<Cart />}/>
-              <Route path="/profile"         element={<Profile />}/>
-              <Route path="/orders"          element={<Orders />}/>
-              <Route path="/messages"        element={<Messages />}/>
-              <Route path="/settings"        element={<Settings />}/>
-              <Route path="/shop"            element={<MyShop />}/>
-              <Route path="/shop/analytics"  element={<ShopAnalytics />}/>
-              <Route path="*"               element={<Navigate to="/" replace/>}/>
+              <Route path="/"               element={<Home />}/>
+              <Route path="/explore"        element={<Explore />}/>
+              <Route path="/deals"          element={<Deals />}/>
+              <Route path="/cart"           element={<Cart />}/>
+              <Route path="/profile"        element={<Profile />}/>
+              <Route path="/orders"         element={<Orders />}/>
+              <Route path="/messages"       element={<Messages />}/>
+              <Route path="/settings"       element={<Settings />}/>
+              <Route path="/shop"           element={<MyShop />}/>
+              <Route path="/shop/analytics" element={<ShopAnalytics />}/>
+              <Route path="*"              element={<Navigate to="/" replace/>}/>
             </Routes>
           </PageWrapper>
         }/>

@@ -1,14 +1,14 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import {
   ArrowLeft, Zap, Share2, Heart, Store,
   Truck, Package, ChevronRight, Loader,
   CheckCircle, AlertCircle, MessageCircle,
-  ShieldCheck, Copy, X, Wallet, Smartphone,
+  ShieldCheck, Copy, X, Shield,
 } from 'lucide-react'
 import { getProductById, getProfile, addToCart, saveProduct, saveProfile } from '../lib/db'
 import { publishOrder, getPool, getReadRelays, DEFAULT_RELAYS, KINDS } from '../lib/nostrSync'
-import { purchaseWithFeeSplit, getBalance, createMintInvoice, pollMintQuote } from '../lib/cashuWallet'
+import { createEscrowInvoice, pollEscrowPayment, publishEscrowOrder } from '../lib/blinkEscrow'
 import { satsToKsh, useRate } from '../lib/rates'
 import { nip19 } from 'nostr-tools'
 
@@ -24,8 +24,6 @@ const C = {
   red:    '#ef4444',
   green:  '#22c55e',
 }
-
-const PENDING_BUY_KEY = 'bitsoko_pending_buy'
 
 function timeAgo(ts) {
   const s = Math.floor(Date.now() / 1000) - ts
@@ -57,126 +55,108 @@ function Avatar({ profile, pubkey, size = 40 }) {
   )
 }
 
-// ── BuyNowSheet ───────────────────────────────
-// Two paths:
-//   A. Any Lightning wallet → QR (mint invoice) → pollMintQuote → purchaseWithFeeSplit
-//   B. Bitsoko wallet balance → purchaseWithFeeSplit directly
-// State persisted to localStorage so switching tabs mid-payment doesn't lose progress
-function BuyNowSheet({ product, quantity, sellerLud16, sellerPubkey, orderMessage, onClose }) {
-  const navigate    = useNavigate()
-  const total       = product.price * quantity
-  const balance     = getBalance()
-  const hasBalance  = balance >= total
+// ── EscrowSheet ───────────────────────────────
+// Buyer pays Blink escrow invoice → funds held → seller paid on delivery confirm
+// State persisted to localStorage so switching apps mid-payment doesn't lose progress
 
-  // Auto-restore step, invoice and sellerLud16 from localStorage on mount
-  const getPending = () => {
+const PENDING_BUY_KEY = 'bitsoko_pending_buy'
+
+// ── EscrowSheet ───────────────────────────────
+// Single poll, single publish, note saved to localStorage before pay
+function EscrowSheet({ product, quantity, sellerLud16, sellerPubkey, onClose }) {
+  const total      = product.price * quantity
+  const cancelRef  = useRef(null)     // holds the single active cancel function
+  const doneRef    = useRef(false)    // true once publish has been called
+
+  // Restore pending if same product was open before (tab switch)
+  const [restored] = useState(() => {
     try {
       const p = JSON.parse(localStorage.getItem(PENDING_BUY_KEY) || '{}')
-      if (p.productId === product.id && Date.now()/1000 - p.createdAt < 600) return p
+      if (p.productId === product.id && Date.now() / 1000 - p.createdAt < 600) return p
     } catch {}
     return null
-  }
-  const pending = getPending()
+  })
 
-  const getInitialStep    = () => pending ? 'qr' : 'choose'
-  const getInitialInvoice = () => pending?.invoice || ''
-  // Use stored lud16 if profile not yet loaded (async timing)
-  const effectiveLud16    = sellerLud16 || pending?.sellerLud16 || ''
+  const [step,    setStep]    = useState(restored ? 'qr' : 'info')
+  const [invoice, setInvoice] = useState(restored?.invoice || '')
+  const [copied,  setCopied]  = useState(false)
+  const [errMsg,  setErrMsg]  = useState('')
+  const [note,    setNote]    = useState(restored?.note || '')
 
-  const [step,       setStep]       = useState(getInitialStep)
-  const [invoice,    setInvoice]    = useState(getInitialInvoice)
-  const [copied,     setCopied]     = useState(false)
-  const [errMsg,     setErrMsg]     = useState('')
-  const [cancelPoll, setCancelPoll] = useState(null)
+  // Cancel poll on unmount
+  useEffect(() => () => { cancelRef.current?.() }, [])
 
-  // If restored to qr step, resume polling
+  // Resume poll if restoring from previous session
   useEffect(() => {
-    if (step !== 'qr' || !invoice) return
-    try {
-      const p = JSON.parse(localStorage.getItem(PENDING_BUY_KEY) || '{}')
-      if (p.hash && p.mintUrl && p.amountSats) {
-        import('@cashu/cashu-ts').then(({ CashuMint, CashuWallet }) => {
-          const mint   = new CashuMint(p.mintUrl)
-          const wallet = new CashuWallet(mint, { unit: 'sat' })
-          wallet.getKeys().then(() => {
-            const resumeLud16 = effectiveLud16 || p.sellerLud16
-            const cancel = pollMintQuote(wallet, p.amountSats, p.hash, p.mintUrl,
-              async () => {
-                localStorage.removeItem(PENDING_BUY_KEY)
-                setStep('paying')
-                try {
-                  await purchaseWithFeeSplit({ sellerLud16: effectiveLud16, totalSats: total, productName: product.name })
-                  await publishOrder({ sellerPubkey, product, quantity, message: orderMessage }).catch(() => {})
-                  setStep('done')
-                } catch(e) { setErrMsg(e.message || 'Routing failed'); setStep('error') }
-              },
-              (err) => { localStorage.removeItem(PENDING_BUY_KEY); setErrMsg(err || 'Expired'); setStep('error') }
-            )
-            setCancelPoll(() => cancel)
-          }).catch(() => {})
-        }).catch(() => {})
-      }
-    } catch {}
+    if (!restored?.paymentHash) return
+    startPoll(restored.paymentHash)
   }, [])
 
-  useEffect(() => () => { cancelPoll?.() }, [cancelPoll])
+  const savePending = (paymentRequest, paymentHash, noteText) => {
+    localStorage.setItem(PENDING_BUY_KEY, JSON.stringify({
+      invoice: paymentRequest, paymentHash,
+      productId: product.id, note: noteText,
+      createdAt: Math.floor(Date.now() / 1000),
+    }))
+  }
 
-  // Path A — external Lightning wallet
-  const handleExternalPay = async () => {
-    setStep('qr'); setErrMsg('')
+  const onPaid = async (paymentHash) => {
+    // Read note from localStorage — most reliable at async callback time
+    let buyerNote = ''
     try {
-      // Get exact mint amount needed (product price + Lightning fee_reserve)
-      // fee_reserve is returned as change after melt — buyer nets product price
-      const feeSats    = Math.floor(total * 0.02)
-      const sellerSats = total - feeSats
-      // Mint total + 4 sat flat buffer for Lightning routing fees on both payments
-      // (our fee payment routing + seller payment routing)
-      // Any unused buffer returns as change after payments
-      const mintAmount = total  // buyer pays exactly the product price
-      const result     = await createMintInvoice(mintAmount)
-      setInvoice(result.invoice)
+      const p = JSON.parse(localStorage.getItem(PENDING_BUY_KEY) || '{}')
+      buyerNote = p.note || ''
+    } catch {}
 
-      // Persist — survives tab switch — include sellerLud16 for profile reload
-      localStorage.setItem(PENDING_BUY_KEY, JSON.stringify({
-        invoice:    result.invoice,
-        hash:       result.hash,
-        mintUrl:    result.mintUrl,
-        amountSats: mintAmount,
-        sellerLud16: effectiveLud16,
-        productId:  product.id,
-        createdAt:  Math.floor(Date.now() / 1000),
-      }))
-
-      try { window.open(`lightning:${result.invoice}`, '_blank') } catch {}
-
-      const cancel = pollMintQuote(result.wallet, mintAmount, result.hash, result.mintUrl,
-        async () => {
-          localStorage.removeItem(PENDING_BUY_KEY)
-          setStep('paying')
-          try {
-            await purchaseWithFeeSplit({ sellerLud16: effectiveLud16, totalSats: total, productName: product.name })
-            await publishOrder({ sellerPubkey, product, quantity, message: orderMessage }).catch(() => {})
-            setStep('done')
-          } catch(e) { setErrMsg(e.message || 'Routing failed'); setStep('error') }
-        },
-        (err) => { localStorage.removeItem(PENDING_BUY_KEY); setErrMsg(err || 'Invoice expired'); setStep('error') }
-      )
-      setCancelPoll(() => cancel)
+    localStorage.removeItem(PENDING_BUY_KEY)
+    setStep('paying')
+    try {
+      await publishEscrowOrder({
+        product: { ...product, sellerLud16 },
+        quantity, totalSats: total,
+        paymentHash, sellerPubkey,
+        buyerMessage: buyerNote,
+      })
+      setStep('done')
     } catch(e) {
-      setErrMsg(e.message || 'Could not generate invoice')
+      setErrMsg(e.message || 'Order failed')
       setStep('error')
     }
   }
 
-  // Path B — Bitsoko wallet
-  const handleWalletPay = async () => {
-    setStep('paying'); setErrMsg('')
+  const startPoll = (paymentHash) => {
+    // Cancel any existing poll first
+    cancelRef.current?.()
+    cancelRef.current = null
+
+    const cancel = pollEscrowPayment(
+      paymentHash,
+      () => {
+        if (doneRef.current) return
+        doneRef.current = true
+        onPaid(paymentHash)
+      },
+      (err) => {
+        localStorage.removeItem(PENDING_BUY_KEY)
+        setErrMsg(err)
+        setStep('error')
+      }
+    )
+    cancelRef.current = cancel
+  }
+
+  const handlePay = async () => {
+    setStep('qr'); setErrMsg('')
     try {
-      await purchaseWithFeeSplit({ sellerLud16: effectiveLud16, totalSats: total, productName: product.name })
-      await publishOrder({ sellerPubkey, product, quantity, message: orderMessage }).catch(() => {})
-      setStep('done')
+      const { paymentRequest, paymentHash } = await createEscrowInvoice(
+        total, `Bitsoko: ${product.name}`
+      )
+      setInvoice(paymentRequest)
+      savePending(paymentRequest, paymentHash, note)
+      try { window.open(`lightning:${paymentRequest}`, '_blank') } catch {}
+      startPoll(paymentHash)
     } catch(e) {
-      setErrMsg(e.message || 'Payment failed')
+      setErrMsg(e.message || 'Could not generate invoice')
       setStep('error')
     }
   }
@@ -187,36 +167,32 @@ function BuyNowSheet({ product, quantity, sellerLud16, sellerPubkey, orderMessag
     setTimeout(() => setCopied(false), 2000)
   }
 
-  const openInWallet = () => {
-    try { window.open(`lightning:${invoice}`, '_blank') } catch {}
-  }
-
-  const cancel = () => {
-    cancelPoll?.()
+  const cancelPay = () => {
+    cancelRef.current?.()
+    cancelRef.current = null
     localStorage.removeItem(PENDING_BUY_KEY)
-    setStep('choose')
+    setStep('info')
     setInvoice('')
   }
 
   return (
     <>
-      <div onClick={() => { cancelPoll?.(); onClose() }}
+      <div onClick={() => { cancelRef.current?.(); onClose() }}
         style={{ position:'fixed',inset:0,zIndex:200,background:'rgba(26,20,16,0.5)',backdropFilter:'blur(2px)' }}/>
       <div style={{
         position:'fixed',bottom:0,left:0,right:0,zIndex:210,
         background:C.white,borderRadius:'20px 20px 0 0',
-        maxHeight:'90vh',display:'flex',flexDirection:'column',
+        maxHeight:'90vh',minHeight:'60vh',display:'flex',flexDirection:'column',
         animation:'sheetUp .25s cubic-bezier(0.32,0.72,0,1)',
         boxShadow:'0 -4px 40px rgba(26,20,16,0.15)',
       }}>
-        {/* Header */}
         <div style={{ padding:'16px 20px 0',flexShrink:0 }}>
           <div style={{ width:36,height:4,borderRadius:2,background:C.border,margin:'0 auto 16px' }}/>
-          <div style={{ display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:4 }}>
+          <div style={{ display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:12 }}>
             <span style={{ fontSize:16,fontWeight:700,color:C.black }}>
-              {step === 'done' ? 'Payment complete' : step === 'paying' ? 'Processing…' : 'Pay now'}
+              {step==='done'?'Order placed!':step==='paying'?'Processing…':'Buy now'}
             </span>
-            <button onClick={() => { cancelPoll?.(); onClose() }}
+            <button onClick={() => { cancelRef.current?.(); onClose() }}
               style={{ width:30,height:30,borderRadius:'50%',background:C.bg,border:`1px solid ${C.border}`,display:'flex',alignItems:'center',justifyContent:'center',cursor:'pointer' }}>
               <X size={14} color={C.muted}/>
             </button>
@@ -232,114 +208,88 @@ function BuyNowSheet({ product, quantity, sellerLud16, sellerPubkey, orderMessag
 
         <div style={{ flex:1,overflowY:'auto',padding:'0 20px 48px' }}>
 
-          {/* ── Choose ── */}
-          {step === 'choose' && (
+          {step === 'info' && (
             <div>
-              <button onClick={handleExternalPay} style={{
-                width:'100%',display:'flex',alignItems:'center',gap:14,padding:'16px',
-                background:C.bg,border:`1.5px solid ${C.border}`,borderRadius:16,
-                cursor:'pointer',textAlign:'left',marginBottom:10,
-              }}>
-                <div style={{ width:46,height:46,borderRadius:13,background:C.white,border:`1px solid ${C.border}`,display:'flex',alignItems:'center',justifyContent:'center',flexShrink:0 }}>
-                  <Zap size={22} fill={C.orange} color={C.orange}/>
+              <div style={{ background:'rgba(247,147,26,0.06)',border:`1px solid rgba(247,147,26,0.2)`,borderRadius:12,padding:'14px 16px',marginBottom:16 }}>
+                <div style={{ display:'flex',alignItems:'center',gap:8,marginBottom:6 }}>
+                  <Shield size={15} color={C.ochre}/>
+                  <span style={{ fontSize:13,fontWeight:700,color:C.black }}>Protected by escrow</span>
                 </div>
-                <div style={{ flex:1 }}>
-                  <div style={{ fontSize:14,fontWeight:700,color:C.black,marginBottom:2 }}>Pay with Lightning wallet</div>
-                  <div style={{ fontSize:11,color:C.muted }}>Opens Phoenix, Blink, Muun, WOS or any installed wallet</div>
+                <div style={{ fontSize:12,color:C.muted,lineHeight:1.7 }}>
+                  Your money is held safely until you receive your order and confirm it.
                 </div>
-                <Smartphone size={16} color={C.muted}/>
-              </button>
-
-              <button
-                onClick={hasBalance ? handleWalletPay : () => navigate('/wallet')}
-                style={{
-                  width:'100%',display:'flex',alignItems:'center',gap:14,padding:'16px',
-                  background:hasBalance?C.black:'rgba(26,20,16,0.04)',
-                  border:`1.5px solid ${hasBalance?C.black:C.border}`,
-                  borderRadius:16,cursor:'pointer',textAlign:'left',marginBottom:20,
-                }}>
-                <div style={{ width:46,height:46,borderRadius:13,background:hasBalance?'rgba(255,255,255,0.1)':'rgba(26,20,16,0.06)',display:'flex',alignItems:'center',justifyContent:'center',flexShrink:0 }}>
-                  <Wallet size={22} color={hasBalance?C.white:C.muted}/>
-                </div>
-                <div style={{ flex:1 }}>
-                  <div style={{ fontSize:14,fontWeight:700,color:hasBalance?C.white:C.muted,marginBottom:2 }}>
-                    {hasBalance ? 'Pay from Bitsoko wallet' : 'Bitsoko wallet — insufficient funds'}
-                  </div>
-                  <div style={{ fontSize:11,color:hasBalance?'rgba(255,255,255,0.6)':C.muted }}>
-                    Balance: {balance.toLocaleString()} sats
-                    {!hasBalance && ` · Need ${(total-balance).toLocaleString()} more`}
-                  </div>
-                </div>
-                {!hasBalance && (
-                  <span style={{ fontSize:10,fontWeight:700,color:C.orange,border:`1px solid ${C.orange}`,borderRadius:99,padding:'2px 8px',flexShrink:0 }}>
-                    Top up
-                  </span>
-                )}
+              </div>
+              <div style={{ fontSize:11,color:C.muted,marginBottom:6 }}>
+                Delivery details, size, colour or any instructions for the seller
+              </div>
+              <textarea
+                value={note}
+                onChange={e => setNote(e.target.value)}
+                placeholder="e.g. Deliver to Westlands, size M, black colour…"
+                rows={3}
+                style={{ width:'100%',padding:'12px 14px',background:C.bg,border:`1.5px solid ${note?C.black:C.border}`,borderRadius:12,outline:'none',resize:'none',fontSize:13,color:C.black,lineHeight:1.6,fontFamily:"'Inter',sans-serif",boxSizing:'border-box',marginBottom:14 }}
+              />
+              <button onClick={handlePay} style={{ width:'100%',padding:'15px',background:C.black,border:'none',borderRadius:14,cursor:'pointer',fontSize:14,fontWeight:700,color:C.white,display:'flex',alignItems:'center',justifyContent:'center',gap:8 }}>
+                <Zap size={16} fill={C.orange} color={C.orange}/> Pay {total.toLocaleString()} sats
               </button>
             </div>
           )}
 
-          {/* ── QR ── */}
           {step === 'qr' && (
             <div style={{ textAlign:'center' }}>
               <div style={{ fontSize:12,color:C.muted,marginBottom:16,lineHeight:1.6 }}>
-                Scan the QR or tap Open in wallet. You can switch tabs safely — payment detected automatically.
+                Scan with any Lightning wallet. Payment held in escrow until you confirm delivery.
               </div>
-              {invoice ? (
-                <img
-                  src={`https://api.qrserver.com/v1/create-qr-code/?size=220x220&data=${encodeURIComponent(invoice)}&bgcolor=f7f4f0&color=1a1410&margin=12`}
-                  alt="Lightning invoice"
-                  style={{ width:220,height:220,borderRadius:16,border:`1px solid ${C.border}`,display:'block',margin:'0 auto 16px' }}
-                />
-              ) : (
-                <div style={{ width:220,height:220,borderRadius:16,background:C.bg,border:`1px solid ${C.border}`,display:'flex',alignItems:'center',justifyContent:'center',margin:'0 auto 16px' }}>
-                  <Loader size={24} color={C.ochre} style={{ animation:'spin 1s linear infinite' }}/>
-                </div>
-              )}
+              {invoice
+                ? <img src={`https://api.qrserver.com/v1/create-qr-code/?size=220x220&data=${encodeURIComponent(invoice)}&bgcolor=f7f4f0&color=1a1410&margin=12`}
+                    alt="invoice" style={{ width:220,height:220,borderRadius:16,border:`1px solid ${C.border}`,display:'block',margin:'0 auto 16px' }}/>
+                : <div style={{ width:220,height:220,borderRadius:16,background:C.bg,border:`1px solid ${C.border}`,display:'flex',alignItems:'center',justifyContent:'center',margin:'0 auto 16px' }}>
+                    <Loader size={24} color={C.ochre} style={{ animation:'spin 1s linear infinite' }}/>
+                  </div>
+              }
               <div style={{ display:'flex',gap:8,justifyContent:'center',marginBottom:16 }}>
-                <button onClick={openInWallet} style={{ display:'inline-flex',alignItems:'center',gap:6,padding:'10px 16px',background:C.black,border:'none',borderRadius:10,cursor:'pointer',fontSize:12,fontWeight:700,color:C.white }}>
-                  <Smartphone size={13}/> Open in wallet
+                <button onClick={() => { try { window.open(`lightning:${invoice}`, '_blank') } catch {} }}
+                  style={{ display:'inline-flex',alignItems:'center',gap:6,padding:'10px 16px',background:C.black,border:'none',borderRadius:10,cursor:'pointer',fontSize:12,fontWeight:700,color:C.white }}>
+                  <Zap size={13}/> Open in wallet
                 </button>
-                <button onClick={copyInvoice} style={{ display:'inline-flex',alignItems:'center',gap:6,padding:'10px 16px',background:C.bg,border:`1px solid ${C.border}`,borderRadius:10,cursor:'pointer',fontSize:12,fontWeight:600,color:copied?C.green:C.black }}>
-                  {copied ? <><CheckCircle size={13}/> Copied</> : <><Copy size={13}/> Copy</>}
+                <button onClick={copyInvoice}
+                  style={{ display:'inline-flex',alignItems:'center',gap:6,padding:'10px 16px',background:C.bg,border:`1px solid ${C.border}`,borderRadius:10,cursor:'pointer',fontSize:12,fontWeight:600,color:copied?C.green:C.black }}>
+                  {copied?<><CheckCircle size={13}/> Copied</>:<><Copy size={13}/> Copy</>}
                 </button>
               </div>
               <div style={{ display:'flex',alignItems:'center',justifyContent:'center',gap:6,fontSize:12,color:C.muted }}>
                 <Loader size={12} style={{ animation:'spin 1s linear infinite' }}/> Waiting for payment…
               </div>
-              <button onClick={cancel} style={{ marginTop:14,background:'none',border:'none',cursor:'pointer',fontSize:12,color:C.muted }}>
-                Cancel
-              </button>
+              <button onClick={cancelPay} style={{ marginTop:14,background:'none',border:'none',cursor:'pointer',fontSize:12,color:C.muted }}>Cancel</button>
             </div>
           )}
 
-          {/* ── Paying ── */}
           {step === 'paying' && (
             <div style={{ textAlign:'center',padding:'32px 0' }}>
               <Loader size={44} color={C.ochre} style={{ animation:'spin 1s linear infinite',display:'block',margin:'0 auto 16px' }}/>
-              <div style={{ fontSize:15,fontWeight:700,color:C.black }}>Routing payment…</div>
+              <div style={{ fontSize:15,fontWeight:700,color:C.black }}>Confirming payment…</div>
             </div>
           )}
 
-          {/* ── Done ── */}
           {step === 'done' && (
             <div style={{ textAlign:'center',padding:'24px 0' }}>
               <CheckCircle size={52} color={C.green} style={{ display:'block',margin:'0 auto 16px' }}/>
-              <div style={{ fontSize:18,fontWeight:700,color:C.black,marginBottom:6 }}>Payment sent!</div>
-              <div style={{ fontSize:12,color:C.muted,marginBottom:28 }}>Order notification sent to seller.</div>
-              <button onClick={onClose} style={{ padding:'13px 40px',background:C.black,border:'none',borderRadius:14,cursor:'pointer',fontSize:14,fontWeight:700,color:C.white }}>
+              <div style={{ fontSize:18,fontWeight:700,color:C.black,marginBottom:8 }}>Order placed!</div>
+              <div style={{ fontSize:12,color:C.muted,lineHeight:1.7,marginBottom:24 }}>
+                Your payment is in escrow. Go to <strong>Orders</strong> when your item arrives to release payment to the seller.
+              </div>
+              <button onClick={onClose} style={{ width:'100%',padding:'13px',background:C.black,border:'none',borderRadius:14,cursor:'pointer',fontSize:14,fontWeight:700,color:C.white }}>
                 Done
               </button>
             </div>
           )}
 
-          {/* ── Error ── */}
           {step === 'error' && (
             <div style={{ textAlign:'center',padding:'24px 0' }}>
               <AlertCircle size={44} color={C.red} style={{ display:'block',margin:'0 auto 16px' }}/>
               <div style={{ fontSize:16,fontWeight:700,color:C.black,marginBottom:8 }}>Payment failed</div>
               <div style={{ fontSize:12,color:C.muted,marginBottom:24,lineHeight:1.5 }}>{errMsg}</div>
-              <button onClick={() => { setStep('choose'); setErrMsg('') }}
+              <button onClick={() => { setStep('info'); setErrMsg('') }}
                 style={{ padding:'12px 32px',background:C.black,border:'none',borderRadius:12,cursor:'pointer',fontSize:13,fontWeight:700,color:C.white }}>
                 Try again
               </button>
@@ -370,7 +320,6 @@ export default function ProductDetail() {
   const [orderMessage, setOrderMessage] = useState('')
   const [showCopied,   setShowCopied]   = useState(false)
   const [showBuySheet, setShowBuySheet] = useState(() => {
-    // Auto-open if a pending payment exists for this product
     try {
       const p = JSON.parse(localStorage.getItem(PENDING_BUY_KEY) || '{}')
       if (p.productId === id && Date.now()/1000 - p.createdAt < 600) return true
@@ -495,9 +444,7 @@ export default function ProductDetail() {
         <Package size={40} color={C.border}/>
         <div style={{ fontSize:'1rem',fontWeight:700,color:C.black }}>Product not found</div>
         <div style={{ fontSize:'0.8rem',color:C.muted }}>It may have been removed or not synced yet</div>
-        <button onClick={() => navigate(-1)} style={{ marginTop:8,padding:'10px 24px',background:C.black,border:'none',borderRadius:12,cursor:'pointer',fontSize:'0.85rem',fontWeight:700,color:C.white }}>
-          Go back
-        </button>
+        <button onClick={() => navigate(-1)} style={{ marginTop:8,padding:'10px 24px',background:C.black,border:'none',borderRadius:12,cursor:'pointer',fontSize:'0.85rem',fontWeight:700,color:C.white }}>Go back</button>
       </div>
     )
   }
@@ -518,7 +465,7 @@ export default function ProductDetail() {
   return (
     <div style={{ background:C.bg,minHeight:'100vh',fontFamily:"'Inter',sans-serif" }}>
 
-      {/* Sticky header */}
+      {/* Header */}
       <div style={{ position:'sticky',top:0,zIndex:50,background:'rgba(247,244,240,0.92)',backdropFilter:'blur(12px)',padding:'14px 20px',display:'flex',alignItems:'center',justifyContent:'space-between' }}>
         <button onClick={() => navigate(-1)} style={{ width:36,height:36,borderRadius:'50%',background:C.white,border:`1px solid ${C.border}`,display:'flex',alignItems:'center',justifyContent:'center',cursor:'pointer' }}>
           <ArrowLeft size={17} color={C.black}/>
@@ -544,7 +491,7 @@ export default function ProductDetail() {
           <div style={{ width:'100%',aspectRatio:'1',overflow:'hidden',position:'relative' }}>
             <img src={images[activeImg]} alt={product.name} style={{ width:'100%',height:'100%',objectFit:'cover' }} onError={e => e.target.style.display='none'}/>
             {images.length > 1 && (
-              <div style={{ position:'absolute',bottom:14,right:14,background:'rgba(0,0,0,0.5)',borderRadius:99,padding:'4px 10px',backdropFilter:'blur(4px)',fontSize:'0.65rem',fontWeight:600,color:C.white,fontFamily:"'Inter',sans-serif" }}>
+              <div style={{ position:'absolute',bottom:14,right:14,background:'rgba(0,0,0,0.5)',borderRadius:99,padding:'4px 10px',backdropFilter:'blur(4px)',fontSize:'0.65rem',fontWeight:600,color:C.white }}>
                 {activeImg + 1} / {images.length}
               </div>
             )}
@@ -567,40 +514,31 @@ export default function ProductDetail() {
       )}
 
       <div style={{ padding:'20px 20px 120px' }}>
-
         {tags.length > 0 && (
           <div style={{ display:'flex',gap:6,flexWrap:'wrap',marginBottom:12 }}>
             {tags.map(t => (
-              <span key={t} style={{ padding:'3px 10px',borderRadius:99,background:C.white,border:`1px solid ${C.border}`,fontSize:'0.65rem',color:C.muted,textTransform:'capitalize',fontFamily:"'Inter',sans-serif" }}>
-                {t}
-              </span>
+              <span key={t} style={{ padding:'3px 10px',borderRadius:99,background:C.white,border:`1px solid ${C.border}`,fontSize:'0.65rem',color:C.muted,textTransform:'capitalize' }}>{t}</span>
             ))}
           </div>
         )}
 
-        {/* Name + price */}
         <div style={{ marginBottom:16 }}>
-          <h1 style={{ fontSize:'1.4rem',fontWeight:700,color:C.black,lineHeight:1.3,marginBottom:10,fontFamily:"'Inter',sans-serif" }}>
-            {product.name}
-          </h1>
+          <h1 style={{ fontSize:'1.4rem',fontWeight:700,color:C.black,lineHeight:1.3,marginBottom:10 }}>{product.name}</h1>
           <div style={{ display:'flex',alignItems:'flex-end',justifyContent:'space-between' }}>
             <div>
               <div style={{ display:'flex',alignItems:'center',gap:6,marginBottom:4 }}>
                 <Zap size={18} fill={C.orange} color={C.orange}/>
-                <span style={{ fontSize:'1.6rem',fontWeight:800,color:C.black,fontFamily:"'Inter',sans-serif" }}>{product.price?.toLocaleString()}</span>
-                <span style={{ fontSize:'0.85rem',color:C.muted,fontFamily:"'Inter',sans-serif" }}>sats</span>
+                <span style={{ fontSize:'1.6rem',fontWeight:800,color:C.black }}>{product.price?.toLocaleString()}</span>
+                <span style={{ fontSize:'0.85rem',color:C.muted }}>sats</span>
               </div>
-              <div style={{ fontSize:'0.78rem',color:C.muted,fontFamily:"'Inter',sans-serif" }}>
-                ≈ {satsToKsh(product.price, rate)}
-              </div>
+              <div style={{ fontSize:'0.78rem',color:C.muted }}>≈ {satsToKsh(product.price, rate)}</div>
             </div>
-            <div style={{ padding:'6px 12px',borderRadius:99,background:inStock?'rgba(34,197,94,0.08)':'rgba(239,68,68,0.08)',border:`1px solid ${inStock?'rgba(34,197,94,0.2)':'rgba(239,68,68,0.2)'}`,fontSize:'0.72rem',fontWeight:600,color:inStock?C.green:C.red,fontFamily:"'Inter',sans-serif" }}>
+            <div style={{ padding:'6px 12px',borderRadius:99,background:inStock?'rgba(34,197,94,0.08)':'rgba(239,68,68,0.08)',border:`1px solid ${inStock?'rgba(34,197,94,0.2)':'rgba(239,68,68,0.2)'}`,fontSize:'0.72rem',fontWeight:600,color:inStock?C.green:C.red }}>
               {stockLabel}
             </div>
           </div>
         </div>
 
-        {/* Seller */}
         <div onClick={() => navigate(`/seller/${product.pubkey}`)} style={{ background:C.white,borderRadius:14,border:`1px solid ${C.border}`,padding:'14px 16px',display:'flex',alignItems:'center',gap:12,cursor:'pointer',marginBottom:20 }}>
           <Avatar profile={profile} pubkey={product.pubkey} size={44}/>
           <div style={{ flex:1,minWidth:0 }}>
@@ -620,20 +558,17 @@ export default function ProductDetail() {
           <ChevronRight size={16} color={C.muted}/>
         </div>
 
-        {/* Description */}
         <div style={{ marginBottom:20 }}>
           <div style={{ fontSize:'0.85rem',fontWeight:700,color:C.black,marginBottom:10 }}>About this product</div>
-          <div style={{ fontSize:'0.88rem',color:'#4a4039',lineHeight:1.75,fontFamily:"'Inter',sans-serif",whiteSpace:'pre-wrap' }}>
+          <div style={{ fontSize:'0.88rem',color:'#4a4039',lineHeight:1.75,whiteSpace:'pre-wrap' }}>
             {product.description || 'No description provided.'}
           </div>
         </div>
 
-        {/* Shipping */}
         {product.shipping?.length > 0 && (
           <div style={{ marginBottom:20 }}>
             <div style={{ fontSize:'0.85rem',fontWeight:700,color:C.black,marginBottom:10 }}>
-              <Truck size={14} style={{ marginRight:6,verticalAlign:'middle' }}/>
-              Shipping options
+              <Truck size={14} style={{ marginRight:6,verticalAlign:'middle' }}/> Shipping options
             </div>
             {product.shipping.map((s, i) => (
               <div key={i} style={{ background:C.white,borderRadius:12,border:`1px solid ${C.border}`,padding:'12px 14px',marginBottom:8,display:'flex',justifyContent:'space-between',alignItems:'center' }}>
@@ -642,9 +577,9 @@ export default function ProductDetail() {
                   <div style={{ fontSize:'0.68rem',color:C.muted,marginTop:2 }}>{s.regions}</div>
                 </div>
                 <div style={{ display:'flex',alignItems:'center',gap:4 }}>
-                  {parseInt(s.cost) === 0
-                    ? <span style={{ fontSize:'0.78rem',fontWeight:700,color:C.green }}>Free</span>
-                    : <><Zap size={12} fill={C.orange} color={C.orange}/><span style={{ fontSize:'0.78rem',fontWeight:700,color:C.black }}>{parseInt(s.cost).toLocaleString()} sats</span></>
+                  {parseInt(s.cost)===0
+                    ?<span style={{ fontSize:'0.78rem',fontWeight:700,color:C.green }}>Free</span>
+                    :<><Zap size={12} fill={C.orange} color={C.orange}/><span style={{ fontSize:'0.78rem',fontWeight:700,color:C.black }}>{parseInt(s.cost).toLocaleString()} sats</span></>
                   }
                 </div>
               </div>
@@ -652,9 +587,7 @@ export default function ProductDetail() {
           </div>
         )}
 
-        <div style={{ fontSize:'0.68rem',color:C.muted,textAlign:'center',marginTop:8 }}>
-          Listed {timeAgo(product.created_at)}
-        </div>
+        <div style={{ fontSize:'0.68rem',color:C.muted,textAlign:'center',marginTop:8 }}>Listed {timeAgo(product.created_at)}</div>
       </div>
 
       {/* Bottom action bar */}
@@ -674,9 +607,9 @@ export default function ProductDetail() {
         </div>
       )}
 
-      {/* Buy Now sheet */}
+      {/* Escrow sheet */}
       {showBuySheet && product && (
-        <BuyNowSheet
+        <EscrowSheet
           product={product}
           quantity={quantity}
           sellerLud16={profile?.lud16 || profile?.lightning || profile?.lud06}
@@ -686,7 +619,7 @@ export default function ProductDetail() {
         />
       )}
 
-      {/* Order sheet */}
+      {/* Send order DM sheet */}
       {showOrder && (
         <>
           <div onClick={() => setShowOrder(false)} style={{ position:'fixed',inset:0,zIndex:200,background:'rgba(26,20,16,0.5)',backdropFilter:'blur(2px)' }}/>
@@ -704,21 +637,20 @@ export default function ProductDetail() {
               <div style={{ display:'flex',alignItems:'center',gap:4,marginTop:6 }}>
                 <Zap size={13} fill={C.orange} color={C.orange}/>
                 <span style={{ fontSize:'0.95rem',fontWeight:800,color:C.black }}>{(product.price*quantity).toLocaleString()} sats</span>
-                <span style={{ fontSize:'0.68rem',color:C.muted }}>≈ {satsToKsh(product.price * quantity, rate)}</span>
+                <span style={{ fontSize:'0.68rem',color:C.muted }}>≈ {satsToKsh(product.price*quantity, rate)}</span>
               </div>
             </div>
-            <textarea value={orderMessage} onChange={e => setOrderMessage(e.target.value)} placeholder="Add a note to the seller (address, size, colour…)" rows={3} style={{ width:'100%',padding:'12px 14px',background:C.bg,border:`1.5px solid ${C.border}`,borderRadius:12,outline:'none',resize:'none',fontSize:'0.85rem',color:C.black,lineHeight:1.6,fontFamily:"'Inter',sans-serif",boxSizing:'border-box',marginBottom:14 }}/>
-            {orderStatus === 'error' && (
-              <div style={{ display:'flex',alignItems:'center',gap:8,padding:'10px 14px',borderRadius:10,background:'rgba(239,68,68,0.06)',border:'1px solid rgba(239,68,68,0.2)',fontSize:'0.75rem',color:C.red,marginBottom:12,fontFamily:"'Inter',sans-serif" }}>
+            <textarea value={orderMessage} onChange={e=>setOrderMessage(e.target.value)} placeholder="Add a note to the seller (address, size, colour…)" rows={3}
+              style={{ width:'100%',padding:'12px 14px',background:C.bg,border:`1.5px solid ${C.border}`,borderRadius:12,outline:'none',resize:'none',fontSize:'0.85rem',color:C.black,lineHeight:1.6,fontFamily:"'Inter',sans-serif",boxSizing:'border-box',marginBottom:14 }}/>
+            {orderStatus==='error' && (
+              <div style={{ display:'flex',alignItems:'center',gap:8,padding:'10px 14px',borderRadius:10,background:'rgba(239,68,68,0.06)',border:'1px solid rgba(239,68,68,0.2)',fontSize:'0.75rem',color:C.red,marginBottom:12 }}>
                 <AlertCircle size={14}/> {orderErr}
               </div>
             )}
             <button onClick={handleOrder} disabled={orderStatus==='sending'||orderStatus==='done'} style={{ width:'100%',padding:'15px',background:orderStatus==='done'?C.green:C.black,border:'none',borderRadius:14,cursor:orderStatus==='sending'||orderStatus==='done'?'not-allowed':'pointer',fontSize:'0.92rem',fontWeight:700,color:C.white,display:'flex',alignItems:'center',justifyContent:'center',gap:8,transition:'all .2s' }}>
-              {orderStatus==='sending' ? <><Loader size={16} style={{ animation:'spin 1s linear infinite' }}/> Sending order…</> : orderStatus==='done' ? <><CheckCircle size={16}/> Order sent!</> : <><MessageCircle size={16}/> Send order to seller</>}
+              {orderStatus==='sending'?<><Loader size={16} style={{ animation:'spin 1s linear infinite' }}/> Sending…</>:orderStatus==='done'?<><CheckCircle size={16}/> Sent!</>:<><MessageCircle size={16}/> Send order</>}
             </button>
-            <div style={{ textAlign:'center',marginTop:12,fontSize:'0.65rem',color:C.muted }}>
-              Encrypted end-to-end via Nostr DM
-            </div>
+            <div style={{ textAlign:'center',marginTop:12,fontSize:'0.65rem',color:C.muted }}>Encrypted end-to-end via Nostr DM</div>
           </div>
         </>
       )}
