@@ -286,7 +286,7 @@ export default function Messages() {
   }
 
   // ── Conversation thread view ───────────────
-  if (selected && selectedConv) {
+  if (selected) {
     return (
       <div style={{ background: C.bg, minHeight: '100vh', fontFamily: "'Inter',sans-serif", display: 'flex', flexDirection: 'column' }}>
 
